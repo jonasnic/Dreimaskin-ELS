@@ -14,7 +14,7 @@
 #define STEPS_REV 200                          // Number of steps per revolution for the stepper motor
 #define MICROSTEPS 16                          // Microstepping setting (e.g., 16 for 1/16 microstepping)
 #define STEPS_PER_REV (STEPS_REV * MICROSTEPS) // Total steps per revolution considering microstepping
-#define MAX_SPEED 60000                        // Maximum speed in steps per second
+#define MAX_SPEED 30000                        // Maximum speed in steps per second
 #define MIN_SPEED 100                          // Minimum speed in steps per second
 #define ACCELERATION 500
 #define DECELERATION 1500
@@ -61,6 +61,7 @@ void moveSteps(uint32_t steps) {
         if (sleepTime < highTime * 2) {
             sleepTime = highTime * 2; // Ensure the sleep time is at least twice the high time to maintain a proper pulse
         }
+        
         uint32_t lowTime = sleepTime - highTime; // Calculate the low time to maintain the total period
         uint32_t chunk = remaining;
         if (chunk > MAX_RMT_STEPS)
