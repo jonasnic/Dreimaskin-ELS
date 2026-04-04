@@ -3,6 +3,85 @@
 #include "encoder.h"
 #include "rmt_setup.h"
 #include "step_counter.h"
+#include "utils.h"
+
+int fill_rmt_buffer(rmt_item32_t *buffer, uint32_t steps, uint32_t speed) {
+    const uint32_t highTime = 10; // Fixed HIGH time for the pulse
+
+    if (steps > MAX_RMT_STEPS) {
+        steps = MAX_RMT_STEPS; // Limit steps to the maximum buffer size
+    }
+
+    uint32_t sleepTime = Hz2Us(speed); // Calculate the total period based on the desired speed
+    if (sleepTime < highTime * 2) {
+        sleepTime = highTime * 2; // Ensure the sleep time is at least twice the high time to maintain a proper pulse
+    }
+    uint32_t lowTime = sleepTime - highTime; // Calculate the LOW time to maintain the total period
+
+    for (uint32_t i = 0; i < steps; i++) {
+        buffer[i].level0 = 1;
+        buffer[i].duration0 = highTime; // HIGH pulse duration
+        buffer[i].level1 = 0;
+        buffer[i].duration1 = lowTime; // LOW pulse duration
+    }
+
+    return steps; // Return the number of steps filled in the buffer
+}
+
+void moveSteps(uint32_t steps) {
+
+    const uint32_t highTime = 10;
+    uint32_t speed = 3e4; // For testing, set a fixed speed of 10,000 steps per second
+
+    uint32_t sleepTime = Hz2Us(speed); // Calculate the sleep time based on the desired speed
+    // Serial.printf("Remaining steps: %u | Speed: %u steps/s | Sleep time: %u us\n", remaining, speed, sleepTime);
+    if (sleepTime < highTime * 2) {
+        sleepTime = highTime * 2; // Ensure the sleep time is at least twice the high time to maintain a proper pulse
+    }
+    uint32_t lowTime = sleepTime - highTime; // Calculate the low time to maintain the total period
+
+    if (steps > MAX_RMT_STEPS)
+        steps = MAX_RMT_STEPS;
+    rmt_item32_t items[MAX_RMT_STEPS];
+
+    for (uint32_t i = 0; i < steps; i++) {
+        items[i].level0 = 1;
+        items[i].duration0 = highTime; // HIGH pulse duration
+        items[i].level1 = 0;
+        items[i].duration1 = lowTime; // LOW pulse duration
+    }
+
+    rmt_write_items(RMT_CH, items, steps, true); // Write the pulse sequence to the RMT channel
+
+    // while (remaining > 0) {
+    //     // uint32_t speed = Update_Speed(remaining);
+    //     uint32_t speed = 1e4; // For testing, set a fixed speed of 10,000 steps per second
+
+    //     uint32_t sleepTime = Hz2Us(speed); // Calculate the sleep time based on the desired speed
+    //     // Serial.printf("Remaining steps: %u | Speed: %u steps/s | Sleep time: %u us\n", remaining, speed, sleepTime);
+    //     if (sleepTime < highTime * 2) {
+    //         sleepTime = highTime * 2; // Ensure the sleep time is at least twice the high time to maintain a proper pulse
+    //     }
+
+    //     uint32_t lowTime = sleepTime - highTime; // Calculate the low time to maintain the total period
+    //     uint32_t chunk = remaining;
+    //     if (chunk > MAX_RMT_STEPS)
+    //         chunk = MAX_RMT_STEPS;
+
+    //     rmt_item32_t items[MAX_RMT_STEPS];
+
+    //     for (uint32_t i = 0; i < chunk; i++) {
+    //         items[i].level0 = 1;
+    //         items[i].duration0 = highTime; // HIGH pulse duration
+    //         items[i].level1 = 0;
+    //         items[i].duration1 = lowTime; // LOW pulse duration
+    //     }
+
+    //     rmt_write_items(RMT_CH, items, chunk, true); // Write the pulse sequence to the RMT channel
+
+    //     remaining -= chunk;
+    // }
+}
 
 void setDirection(bool dir) {
     static bool currentDir = digitalRead(DIR_PIN); // Read the initial direction from the DIR pin
@@ -12,12 +91,6 @@ void setDirection(bool dir) {
         delayMicroseconds(50); // REQUIRED
         currentDir = dir;
     }
-}
-uint32_t Hz2microseconds(uint32_t frequency) {
-    if (frequency == 0) {
-        return 0; // Avoid division by zero
-    }
-    return 1000000 / frequency; // Convert frequency in Hz to period in microseconds
 }
 
 uint32_t Update_Speed(uint32_t steps) {
@@ -45,96 +118,7 @@ uint32_t Update_Speed(uint32_t steps) {
     return currentSpeed;
 }
 
-void updateStepper(int32_t &targetCount) {
-    int16_t lastStepCount = 0; // Variable to store the last step count for comparison
-    int16_t StepCount;
-    pcnt_get_counter_value(STEP_COUNTER_PCNT_UNIT, &StepCount); // Get the current count from the step counter
-
-    static int32_t totalStepsMoved = 0;             // Variable to keep track of the total steps moved
-    totalStepsMoved += (StepCount - lastStepCount); // Update total steps moved based on the change in step count
-    lastStepCount = StepCount;                      // Update the last step count for the next comparison
-
-    static int i;
-    if (i++ % 10 == 0) { // Print the step count every 10 iterations for debugging
-        Serial.print("Current Step Count: ");
-        Serial.println(StepCount);
-    }
-
-    if (StepCount < targetCount) {
-        setDirection(HIGH);                 // Set direction to forward
-        moveSteps(targetCount - StepCount); // Move the stepper motor by the required number of steps
-    } else if (StepCount > targetCount) {
-        setDirection(LOW);                  // Set direction to reverse
-        moveSteps(StepCount - targetCount); // Move the stepper motor by the required number of steps
-    }
-}
-
-volatile int32_t targetStepCount = 0; // Global variable to store the target step count for the stepper motor
-int fill_rmt_buffer() {
-}
-
-void moveSteps(int32_t steps) {
-    uint32_t remaining = steps;
-    // uint32_t sleepTime = Hz2microseconds(speed); // Calculate the sleep time based on the desired speed
-    // sleepTime = 100;                             // For testing, set a fixed sleep time of 100 microseconds (10 kHz pulse frequency)
-
-    const uint32_t highTime = 10;
-
-    // Serial.print("Moving ");
-    // Serial.print(steps);
-    // Serial.print(" steps at ");
-    // Serial.print(speed);
-    // Serial.print(" steps/s (sleep time: ");
-    // Serial.print(sleepTime);
-    // Serial.println(" us)");
-    while (remaining > 0) {
-        uint32_t speed = Update_Speed(remaining);
-
-        uint32_t sleepTime = Hz2microseconds(speed); // Calculate the sleep time based on the desired speed
-        // Serial.printf("Remaining steps: %u | Speed: %u steps/s | Sleep time: %u us\n", remaining, speed, sleepTime);
-        if (sleepTime < highTime * 2) {
-            sleepTime = highTime * 2; // Ensure the sleep time is at least twice the high time to maintain a proper pulse
-        }
-
-        uint32_t lowTime = sleepTime - highTime; // Calculate the low time to maintain the total period
-        uint32_t chunk = remaining;
-        if (chunk > MAX_RMT_STEPS)
-            chunk = MAX_RMT_STEPS;
-
-        rmt_item32_t items[MAX_RMT_STEPS];
-
-        for (uint32_t i = 0; i < chunk; i++) {
-            items[i].level0 = 1;
-            items[i].duration0 = highTime; // HIGH pulse duration
-            items[i].level1 = 0;
-            items[i].duration1 = lowTime; // LOW pulse duration
-        }
-
-        rmt_write_items(RMT_CH, items, chunk, true); // Write the pulse sequence to the RMT channel
-
-        remaining -= chunk;
-    }
-}
-
 void loopMotionTask() {
-    // This function can be called repeatedly in the main loop to update the motion control
-    // For example, you could read the encoder count and adjust the targetStepCount accordingly
-    // const int16_t StepsPrEncoderPuls = (MICROSTEPS * STEPS_PER_REV) / SPINDEL_ENCODER_PPR; // Calculate the number of steps per encoder revolution based on PPR and microstepping
-    // static int32_t targetStepCount = 0;                                                    // Variable to store the target step count for the stepper motor
-    // static int16_t lastEncoderCount = 0;
-    // int16_t encoderCount;
-    // pcnt_get_counter_value(SPINDEL_ENCODER_PCNT_UNIT, &encoderCount); // Get the current count from the pulse counter
-    // if (encoderCount != lastEncoderCount) {                           // Check if the encoder count has changed
-    //     int16_t countChange = encoderCount - lastEncoderCount;        // Calculate the change in encoder count since the last reading
-    //     lastEncoderCount = encoderCount;                              // Print the change in encoder count to the serial monitor
-    //     Serial.print("Encoder Count: ");
-    //     Serial.println(encoderCount);
-
-    //     // Add to targer
-    //     targetStepCount += countChange * StepsPrEncoderPuls; // Update the target step count based on the change in encoder count
-    // }
-
-    // updateStepper(targetStepCount); // Update the stepper motor position to move towards the target step count
 
     int16_t StepCount;
     pcnt_get_counter_value(STEP_COUNTER_PCNT_UNIT, &StepCount);
@@ -154,30 +138,47 @@ void loopMotionTask() {
     totalSteps += stepDelta;
 
     static int i = 0;
-    // if (lastStepCount != StepCount) { // Print the step count every 10 changes for debugging
-    //     Serial.print("Last Step Count: ");
-    //     Serial.print(lastStepCount);
-    //     Serial.print(" | Current Step Count: ");
-    //     Serial.print(StepCount);
-    //     Serial.print(" | Step Delta: ");
-    //     Serial.print(stepDelta);
-    //     Serial.print(" | Total Steps: ");
-    //     Serial.println(totalSteps);
-    // }
 }
 
 void runMotionPlanner(int32_t &targetCount) {
     // This function can implement a motion planning algorithm to smoothly move towards the target count
     // For simplicity, we will just call updateStepper in this example, but you could add acceleration profiles, etc. here
     // updateStepper(targetCount);
-    
+}
+void update_current_position(int32_t *current_position) {
+    int16_t StepCount;
+    pcnt_get_counter_value(STEP_COUNTER_PCNT_UNIT, &StepCount);
+
+    static int16_t lastStepCount = 0; // persist between calls
+    int16_t stepDelta;
+
+    stepDelta = StepCount - lastStepCount;
+    if (stepDelta > 30000) {
+        stepDelta -= INT16_MIN;
+    }
+
+    if (stepDelta < -30000) {
+        stepDelta += INT16_MAX;
+    }
+    *current_position += stepDelta;
+    lastStepCount = StepCount;
+}
+
+void move_toward_target(int32_t *target, int32_t *current_position) {
+    int32_t stepsToMove = *target - *current_position;
+    if (stepsToMove != 0) {
+        setDirection(stepsToMove > 0); // Set direction based on whether we need to move forward or backward
+        moveSteps(abs(stepsToMove));   // Move the required number of steps
+    }
 }
 
 void motionTask(void *pv) {
     MotionCommand cmd;
-    int32_t target = 0;
 
-        // Any initialization code for the motion task can go here
+    int32_t target_position = 0;
+    int32_t current_position = 0;
+
+    // Any initialization code for the motion task can go here
     // digitalWrite(PULSE_PIN, LOW);     // Ensure the PULSE pin is LOW at startup
     digitalWrite(ENABLE_PIN, LOW); // Enable the stepper motor driver
     digitalWrite(DIR_PIN, HIGH);   // Set initial direction (e.g., LOW for forward)
@@ -185,19 +186,27 @@ void motionTask(void *pv) {
     pinMode(DIR_PIN, OUTPUT);
     pinMode(ENABLE_PIN, OUTPUT);
 
-    
-
-    setupEncoder();                          // Initialize the encoder interface
-    setupRMT((gpio_num_t)PULSE_PIN, RMT_CH); // Initialize the RMT peripheral for generating step pulses
+    setupEncoder();                                // Initialize the encoder interface
+    setupRMT((gpio_num_t)PULSE_PIN, RMT_CH, NULL); // Initialize the RMT peripheral for generating step pulses
     setupStepCounter((gpio_num_t)PULSE_WATCH_PIN, (gpio_num_t)DIR_WATCH_PIN);
 
     for (;;) {
+        update_current_position(&current_position);
+
         if (xQueueReceive(motionQueue, &cmd, 0) == pdTRUE) {
-            target = cmd.target;
-            moveSteps(target);
+            target_position = cmd.target;
         }
+        move_toward_target(&target_position, &current_position);
 
         // runMotionPlanner(target);
+
+        static int i = 0;
+        if(i++ % 100 == 0) {
+            MotionData data;
+            data.type = POSITION;
+            data.value.position = current_position;
+            xQueueSend(UIQueue, &data, 0);
+        }
 
         vTaskDelay(1); // yields CPU but keeps timing stable
     }

@@ -1,6 +1,7 @@
+#include "driver/rmt.h"
 #include "rmt_setup.h"
 
-void setupRMT(gpio_num_t pulsePin, rmt_channel_t channel) {
+void setupRMT(gpio_num_t pulsePin, rmt_channel_t channel, rmt_tx_end_fn_t tx_end_callback) {
     rmt_config_t config = {};
     config.rmt_mode = RMT_MODE_TX;
     config.channel = channel;
@@ -12,7 +13,9 @@ void setupRMT(gpio_num_t pulsePin, rmt_channel_t channel) {
     config.tx_config.carrier_en = false;
     config.tx_config.idle_output_en = true;
     config.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
+    
 
     rmt_config(&config);
     rmt_driver_install(config.channel, 0, 0);
+    rmt_register_tx_end_callback(tx_end_callback, NULL);
 }

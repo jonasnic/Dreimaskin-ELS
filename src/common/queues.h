@@ -21,12 +21,19 @@ typedef enum
 
 typedef union
 {
-    MotionDataType type;
     int32_t speed;
     int32_t position;
     uint8_t direction;
+} MotionDataValue;
+
+typedef struct
+{
+    MotionDataType type;
+    MotionDataValue value;
 } MotionData;
 
+
 extern QueueHandle_t motionQueue;
+extern QueueHandle_t UIQueue;
 
 void initQueues();

@@ -42,6 +42,14 @@ void uiTask(void *pv)
             xQueueSend(motionQueue, &cmd, 0);
         }
 
+        MotionData data;
+
+        if(xQueueReceive(UIQueue, &data, 0) == pdTRUE) {
+            if(data.type == POSITION) {
+                Serial.print("Current Position: ");
+                Serial.println(data.value.position);
+            }
+        }
         vTaskDelay(5);
     }
 }

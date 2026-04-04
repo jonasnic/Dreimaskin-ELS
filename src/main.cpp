@@ -1,7 +1,7 @@
 
 
 #include <Arduino.h>
-#include "motion/motion_task.h"
+#include "motion_task.h"
 #include "UI/ui_task.h"
 #include "common/queues.h"
 

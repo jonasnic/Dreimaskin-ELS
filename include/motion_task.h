@@ -22,10 +22,10 @@
 
 #define RMT_CH RMT_CHANNEL_0
 void updateStepper(int32_t &targetCount);
-uint32_t Hz2microseconds(uint32_t speedInHz);
+uint32_t Hz2Us(uint32_t speedInHz);
 void setDirection(bool dir);
 uint32_t Update_Speed(uint32_t steps);
-void moveSteps(int32_t steps);
+void moveSteps(uint32_t steps);
 
 void motionTask(void *pv);
 
