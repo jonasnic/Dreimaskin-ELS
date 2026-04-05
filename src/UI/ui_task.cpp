@@ -49,6 +49,11 @@ void uiTask(void *pv)
                 Serial.print("Current Position: ");
                 Serial.println(data.value.position);
             }
+            else if(data.type == SPEED) {
+                Serial.print("Current Speed: ");
+                Serial.println(data.value.speed);   
+            }
+
         }
         vTaskDelay(5);
     }
