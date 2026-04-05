@@ -86,7 +86,6 @@ uint32_t Update_Speed(int32_t remainingSteps) {
     int32_t filter = 50;
     currentSpeed =
         (currentSpeed * (filter - 1) + targetVelocity) / filter;
-    
 
     // deadband near stop
     if (abs(remainingSteps) < 2)
@@ -153,6 +152,11 @@ void move_toward_target() {
         moveSteps(abs(stepsToMove));   // Move the required number of steps
     }
 }
+/*
+This callback is called by the RMT driver when it finishes transmitting the pulse sequence.
+We use it to check if we've reached the target position and, if not, to continue moving towards the target.
+It is also called in between moves, like to initiate the first move towards the target when we receive a new command in the motion task loop.
+*/
 void onRMTTransmissionComplete(rmt_channel_t channel, void *arg) {
     if (current_position == target_position) {
         running = false;  // Clear the running flag when we reach the target
@@ -164,17 +168,24 @@ void onRMTTransmissionComplete(rmt_channel_t channel, void *arg) {
 void motionTask(void *pv) {
     MotionCommand cmd;
 
-    // Any initialization code for the motion task can go here
-    // digitalWrite(PULSE_PIN, LOW);     // Ensure the PULSE pin is LOW at startup
+    //-------- For sending data to the UI task --------
+    MotionData motionData;
+    motionData.type = POSITION;
+
+    MotionData speedData;
+    speedData.type = SPEED;
+    //-----------------------------------------------
+
+    //---------Seting the pins and peripherals---------
     digitalWrite(ENABLE_PIN, LOW); // Enable the stepper motor driver
-    digitalWrite(DIR_PIN, HIGH);   // Set initial direction (e.g., LOW for forward)
-    // pinMode(PULSE_PIN, OUTPUT);
+    digitalWrite(DIR_PIN, LOW);    // Set initial direction (e.g., LOW for forward)
     pinMode(DIR_PIN, OUTPUT);
     pinMode(ENABLE_PIN, OUTPUT);
 
     setupEncoder();                                                     // Initialize the encoder interface
     setupRMT((gpio_num_t)PULSE_PIN, RMT_CH, onRMTTransmissionComplete); // Initialize the RMT peripheral for generating step pulses
     setupStepCounter((gpio_num_t)PULSE_WATCH_PIN, (gpio_num_t)DIR_WATCH_PIN);
+    //-----------------------------------------------
 
     for (;;) {
         // update_current_position(&current_position);
@@ -190,13 +201,11 @@ void motionTask(void *pv) {
 
         static int i = 0;
         if (i++ % 100 == 0) {
-            MotionData data;
-            data.type = POSITION;
-            data.value.position = current_position;
-            xQueueSend(UIQueue, &data, 0);
 
-            MotionData speedData;
-            speedData.type = SPEED;
+            motionData.value.position = current_position;
+            xQueueSend(UIQueue, &motionData, 0);
+
+            ;
             speedData.value.speed = currentSpeed;
             xQueueSend(UIQueue, &speedData, 0);
         }
