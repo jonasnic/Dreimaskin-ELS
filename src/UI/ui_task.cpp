@@ -1,6 +1,7 @@
 
 
 #include "ui_task.h"
+#include "mqtt_manager.h"
 
 void uiTask(void *pv)
 {
@@ -43,17 +44,24 @@ void uiTask(void *pv)
         }
 
         MotionData data;
+        static int32_t lastPosition = 0;
+        static int32_t lastSpeed = 0;
 
         if(xQueueReceive(UIQueue, &data, 0) == pdTRUE) {
-            if(data.type == POSITION) {
-                Serial.print("Current Position: ");
+            if(data.type == POSITION && data.value.position != lastPosition) {
+
+                Serial.print("Current_Position:");
                 Serial.println(data.value.position);
+                lastPosition = data.value.position;
             }
-            else if(data.type == SPEED) {
-                Serial.print("Current Speed: ");
-                Serial.println(data.value.speed);   
+            else if(data.type == SPEED && data.value.speed != lastSpeed) {
+                Serial.print("Current_Speed:");
+                Serial.println(data.value.speed);
+                lastSpeed = data.value.speed;
             }
 
+            // Publish to MQTT if connected (data cycles through position and speed)
+            publishMotionStatus(lastPosition, lastSpeed);
         }
         vTaskDelay(5);
     }

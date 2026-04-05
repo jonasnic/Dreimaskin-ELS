@@ -205,7 +205,6 @@ void motionTask(void *pv) {
             motionData.value.position = current_position;
             xQueueSend(UIQueue, &motionData, 0);
 
-            ;
             speedData.value.speed = currentSpeed;
             xQueueSend(UIQueue, &speedData, 0);
         }

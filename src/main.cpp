@@ -4,11 +4,16 @@
 #include "motion_task.h"
 #include "UI/ui_task.h"
 #include "common/queues.h"
+#include "wifi_manager.h"
+#include "mqtt_manager.h"
 
 void setup() {
     Serial.begin(115200);
 
     initQueues();
+
+    startWiFiTask(1, 0);
+    startMQTTTask(1, 0);
 
     
     xTaskCreatePinnedToCore(
