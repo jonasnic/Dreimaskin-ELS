@@ -13,6 +13,7 @@ static int32_t currentSpeed = 0; // signed steps/sec
 static volatile bool motionBlockDone = true;
 static TaskHandle_t motionTaskHandle = NULL;
 static constexpr float kMaxSpeedDeltaPerStep = 250.0f;
+static constexpr uint32_t kMaxPulsePeriodUs = 2000;
 
 // Ping-pong buffers reduce gaps by avoiding write/read contention on the same buffer.
 static rmt_item32_t rmt_buffers[2][MAX_RMT_STEPS];
@@ -42,6 +43,7 @@ static void generate_motion_block(uint32_t steps, int32_t accel_sign, bool dir) 
 
     for (uint32_t i = 0; i < steps; i++) {
         uint32_t period = Hz2Us((uint32_t)speed);
+        if (period > kMaxPulsePeriodUs) period = kMaxPulsePeriodUs;
         if (period < min_period) period = min_period;
 
         buffer[i].level0 = 1;

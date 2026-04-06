@@ -8,7 +8,7 @@ void setupRMT(gpio_num_t pulsePin, rmt_channel_t channel, rmt_tx_end_fn_t tx_end
     config.gpio_num = pulsePin;
     config.clk_div = 80; // 1 tick = 1us (80MHz / 80)
 
-    config.mem_block_num = 1;
+    config.mem_block_num = 4;
     config.tx_config.loop_en = false;
     config.tx_config.carrier_en = false;
     config.tx_config.idle_output_en = true;
