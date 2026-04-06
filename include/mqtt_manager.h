@@ -10,3 +10,6 @@ bool isMQTTConnected();
 
 // Publish position and speed updates
 void publishMotionStatus(int32_t position, int32_t speed);
+
+// Publish commanded target
+void publishTargetStatus(int32_t target);

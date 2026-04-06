@@ -24,6 +24,7 @@ PubSubClient mqttClient(wifiClient);
 constexpr const char* kCmdTopic = "dreimaskin_els/command";
 constexpr const char* kStatusPosTopic = "dreimaskin_els/status/position";
 constexpr const char* kStatusSpeedTopic = "dreimaskin_els/status/speed";
+constexpr const char* kStatusTargetTopic = "dreimaskin_els/status/target";
 constexpr const char* kStatusAliveTopic = "dreimaskin_els/status";
 constexpr TickType_t kReconnectInterval = pdMS_TO_TICKS(5000);
 
@@ -131,4 +132,14 @@ void publishMotionStatus(int32_t position, int32_t speed) {
     // Publish speed
     snprintf(buf, sizeof(buf), "%ld", speed);
     mqttClient.publish(kStatusSpeedTopic, buf);
+}
+
+void publishTargetStatus(int32_t target) {
+    if (!mqttClient.connected()) {
+        return;
+    }
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%ld", target);
+    mqttClient.publish(kStatusTargetTopic, buf, true);
 }

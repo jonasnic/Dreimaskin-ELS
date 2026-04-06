@@ -4,15 +4,19 @@
 #include "rmt_setup.h"
 #include "step_counter.h"
 #include "utils.h"
+#include "freertos/task.h"
 
 volatile int32_t target_position = 0;
 volatile int32_t current_position = 0;
 volatile bool running = false;   // Flag to indicate if the motion task is currently executing a move. will use to know if ISR are in effect or not
 static int32_t currentSpeed = 0; // signed steps/sec
 static volatile bool motionBlockDone = true;
+static TaskHandle_t motionTaskHandle = NULL;
+static constexpr float kMaxSpeedDeltaPerStep = 250.0f;
 
-// Static RMT buffer to avoid large stack allocation
-static rmt_item32_t rmt_buffer[MAX_RMT_STEPS];
+// Ping-pong buffers reduce gaps by avoiding write/read contention on the same buffer.
+static rmt_item32_t rmt_buffers[2][MAX_RMT_STEPS];
+static uint8_t nextBufferIndex = 0;
 
 static bool speed_direction_is_positive() {
     return currentSpeed >= 0;
@@ -34,18 +38,23 @@ static void generate_motion_block(uint32_t steps, int32_t accel_sign, bool dir) 
     float speed = fabsf((float)currentSpeed);
     if (speed < 1.0f) speed = 1.0f; // only for starting from 0
 
+    rmt_item32_t *buffer = rmt_buffers[nextBufferIndex];
+
     for (uint32_t i = 0; i < steps; i++) {
         uint32_t period = Hz2Us((uint32_t)speed);
         if (period < min_period) period = min_period;
 
-        rmt_buffer[i].level0 = 1;
-        rmt_buffer[i].duration0 = PULSE_HIGH_TIME_US;
-        rmt_buffer[i].level1 = 0;
-        rmt_buffer[i].duration1 = period - PULSE_HIGH_TIME_US;
+        buffer[i].level0 = 1;
+        buffer[i].duration0 = PULSE_HIGH_TIME_US;
+        buffer[i].level1 = 0;
+        buffer[i].duration1 = period - PULSE_HIGH_TIME_US;
 
         // update speed per step
         if (accel_sign != 0) {
-            speed += (float)accel_sign / speed;
+            float dv = (float)accel_sign / speed;
+            if (dv > kMaxSpeedDeltaPerStep) dv = kMaxSpeedDeltaPerStep;
+            if (dv < -kMaxSpeedDeltaPerStep) dv = -kMaxSpeedDeltaPerStep;
+            speed += dv;
 
             if (speed < 0.0f) speed = 0.0f; // allow full stop
             if (speed > MAX_SPEED) speed = MAX_SPEED;
@@ -60,7 +69,9 @@ static void generate_motion_block(uint32_t steps, int32_t accel_sign, bool dir) 
     else
         running = true;
 
-    if (rmt_write_items(RMT_CH, rmt_buffer, steps, false) == ESP_OK) {
+    if (rmt_write_items(RMT_CH, buffer, steps, false) == ESP_OK) {
+        apply_position_delta(steps, dir);
+        nextBufferIndex ^= 1;
         motionBlockDone = false;
     } else {
         running = false;
@@ -89,28 +100,21 @@ static inline uint32_t steps_to_stop(int32_t speed) {
     return (uint64_t)v * v / (2 * ACCELERATION);
 }
 
-void update_current_position(int32_t *current_position) {
-    int16_t StepCount;
-    pcnt_get_counter_value(STEP_COUNTER_PCNT_UNIT, &StepCount);
-
-    static int16_t lastStepCount = 0; // persist between calls
-    int16_t stepDelta;
-
-    stepDelta = StepCount - lastStepCount;
-    if (stepDelta > 30000) {
-        stepDelta -= INT16_MIN;
-    }
-
-    if (stepDelta < -30000) {
-        stepDelta += INT16_MAX;
-    }
-    *current_position += stepDelta;
-    lastStepCount = StepCount;
-}
-
 static void move_toward_target() {
+    if (!running) {
+        // No active pulse train: stale speed sign/magnitude must not influence a new command.
+        currentSpeed = 0;
+    }
+
     int32_t dist = target_position - current_position;
+    uint32_t remaining = abs(dist);
     bool dir = (dist > 0);
+
+    if (remaining == 0) {
+        running = false;
+        currentSpeed = 0;
+        return;
+    }
 
     // prevent instant reversal at speed
     if ((currentSpeed > 0 && !dir) || (currentSpeed < 0 && dir)) {
@@ -122,14 +126,12 @@ static void move_toward_target() {
 
         bool currentDir = speed_direction_is_positive();
         generate_motion_block(block, -ACCELERATION, currentDir);
-        apply_position_delta(block, currentDir);
         return;
     }
 
     if (dist != 0) {
         setDirection(dir);
 
-        uint32_t remaining = abs(dist);
         uint32_t stop_steps = steps_to_stop(currentSpeed);
 
         uint32_t block = remaining;
@@ -143,21 +145,7 @@ static void move_toward_target() {
         else
             generate_motion_block(block, 0, dir); // cruise
 
-        apply_position_delta(block, dir);
-
         running = true;
-    } else {
-        // target reached → brake if still moving
-        if (currentSpeed != 0) {
-            uint32_t stop_steps = steps_to_stop(currentSpeed);
-            bool currentDir = speed_direction_is_positive();
-            generate_motion_block(stop_steps, -ACCELERATION, currentDir);
-            apply_position_delta(stop_steps, currentDir);
-            running = true;
-        } else {
-            running = false; // actually stopped
-            currentSpeed = 0;
-        }
     }
 }
 
@@ -169,10 +157,19 @@ It is also called in between moves, like to initiate the first move towards the 
 void IRAM_ATTR onRMTTransmissionComplete(rmt_channel_t channel, void *arg) {
     if (channel == RMT_CH) {
         motionBlockDone = true;
+        if (motionTaskHandle != NULL) {
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            vTaskNotifyGiveFromISR(motionTaskHandle, &xHigherPriorityTaskWoken);
+            if (xHigherPriorityTaskWoken == pdTRUE) {
+                portYIELD_FROM_ISR();
+            }
+        }
     }
 }
 
 void motionTask(void *pv) {
+    motionTaskHandle = xTaskGetCurrentTaskHandle();
+
     MotionCommand cmd;
 
     //-------- For sending data to the UI task --------
@@ -195,12 +192,15 @@ void motionTask(void *pv) {
     //-----------------------------------------------
     bool lastRunning = false;
     for (;;) {
-        // update_current_position(&current_position);
         bool targetChanged = false;
 
         if (xQueueReceive(motionQueue, &cmd, 0) == pdTRUE) {
             target_position = cmd.target;
             targetChanged = true;
+
+            if (!running && motionBlockDone) {
+                currentSpeed = 0;
+            }
         }
         if (lastRunning != running) {
             Serial.printf("Running: %s\n", running ? "Yes" : "No");
@@ -221,6 +221,7 @@ void motionTask(void *pv) {
             xQueueSend(UIQueue, &speedData, 0);
         }
 
-        vTaskDelay(1); // yields CPU but keeps timing stable
+        // Sleep until TX complete notification or timeout; notify path minimizes inter-block gap.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
     }
 }

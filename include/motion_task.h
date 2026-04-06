@@ -11,10 +11,10 @@
 #define STEPS_REV 200                          // Number of steps per revolution for the stepper motor
 #define MICROSTEPS 16                          // Microstepping setting (e.g., 16 for 1/16 microstepping)
 #define STEPS_PER_REV (STEPS_REV * MICROSTEPS) // Total steps per revolution considering microstepping
-#define MAX_SPEED 50000                        // Maximum speed in steps per second
+#define MAX_SPEED 70000                        // Maximum speed in steps per second
 #define MIN_SPEED 100                          // Minimum speed in steps per second
 #define MIN_SPEED_PERIODE (uint32_t)(1e6 / MAX_SPEED) // Minimum pulse period in microseconds corresponding to the maximum speed
-#define ACCELERATION 10000
+#define ACCELERATION 9000
 #define DECELERATION -ACCELERATION
 #define BELTRATIO 3                                             // Gear ratio of the belt drive (if applicable)
 #define AXEL_PITCH 5.0                                          // mm movement per revolution of the axel (e.g., for a lead screw with 5mm pitch)

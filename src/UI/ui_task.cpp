@@ -10,6 +10,7 @@ void uiTask(void *pv)
     char incomingString[100];
     byte incomingStiringIndex = 0;
     bool stringComplete = false;
+    int32_t target;
     for (;;)
     {
         if (Serial.available())
@@ -34,13 +35,14 @@ void uiTask(void *pv)
             incomingString[sizeof(incomingString) - 1] = '\0'; // Ensure null-termination
             Serial.print("Received command: ");
             Serial.println(incomingString);
-            int steps = atoi(incomingString);
+            target = atoi(incomingString);
 
             cmd.cmd = 1;
-            cmd.target = steps;
+            cmd.target = target;
             cmd.speed = 2000;
 
             xQueueSend(motionQueue, &cmd, 0);
+            publishTargetStatus(target);
         }
 
         MotionData data;
@@ -62,6 +64,7 @@ void uiTask(void *pv)
 
             // Publish to MQTT if connected (data cycles through position and speed)
             publishMotionStatus(lastPosition, lastSpeed);
+
         }
         vTaskDelay(5);
     }
