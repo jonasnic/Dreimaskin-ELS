@@ -24,6 +24,7 @@ PubSubClient mqttClient(wifiClient);
 constexpr const char* kCmdTopic = "dreimaskin_els/command";
 constexpr const char* kStatusPosTopic = "dreimaskin_els/status/position";
 constexpr const char* kStatusSpeedTopic = "dreimaskin_els/status/speed";
+constexpr const char* kStatusAliveTopic = "dreimaskin_els/status";
 constexpr TickType_t kReconnectInterval = pdMS_TO_TICKS(5000);
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -67,8 +68,14 @@ void connectToMQTT() {
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
 
-    if (mqttClient.connect(MQTT_CLIENT_ID)) {
+    // Connect with last will: publish "DEAD" if device disconnects unexpectedly
+    if (mqttClient.connect(MQTT_CLIENT_ID, kStatusAliveTopic, 0, true, "DEAD")) {
         Serial.println("[MQTT] Connected to broker");
+        
+        // Publish ALIVE message to indicate successful connection
+        mqttClient.publish(kStatusAliveTopic, "ALIVE", true);
+        Serial.printf("[MQTT] Published ALIVE to %s\n", kStatusAliveTopic);
+        
         mqttClient.subscribe(kCmdTopic);
         Serial.printf("[MQTT] Subscribed to %s\n", kCmdTopic);
     } else {

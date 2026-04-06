@@ -9,37 +9,64 @@ volatile int32_t target_position = 0;
 volatile int32_t current_position = 0;
 volatile bool running = false;   // Flag to indicate if the motion task is currently executing a move. will use to know if ISR are in effect or not
 static int32_t currentSpeed = 0; // signed steps/sec
+static volatile bool motionBlockDone = true;
 
-void moveSteps(uint32_t steps) {
+// Static RMT buffer to avoid large stack allocation
+static rmt_item32_t rmt_buffer[MAX_RMT_STEPS];
 
-    // const uint32_t highTime = 10;
-    // uint32_t speed = 3e4; // For testing, set a fixed speed of 10,000 steps per second
+static bool speed_direction_is_positive() {
+    return currentSpeed >= 0;
+}
 
-    // uint32_t sleepTime = Hz2Us(speed); // Calculate the sleep time based on the desired speed
-    // // Serial.printf("Remaining steps: %u | Speed: %u steps/s | Sleep time: %u us\n", remaining, speed, sleepTime);
-    // if (sleepTime < highTime * 2) {
-    //     sleepTime = highTime * 2; // Ensure the sleep time is at least twice the high time to maintain a proper pulse
-    // }
-    // uint32_t lowTime = sleepTime - highTime; // Calculate the low time to maintain the total period
-    uint32_t speed = Update_Speed(steps);
-    uint32_t sleepTime = Hz2Us(speed);             // Calculate the sleep time based on the desired speed
-    const uint32_t highTime = 2;                   // Fixed HIGH time for the pulse
-    const uint32_t lowTime = sleepTime - highTime; // Fixed LOW time for the pulse (for testing, set to 90us for a total period of 100us, which corresponds to 10,000 steps per second)
+static void apply_position_delta(uint32_t steps, bool dir) {
+    if (dir)
+        current_position += steps;
+    else
+        current_position -= steps;
+}
 
-    if (steps > MAX_RMT_STEPS)
-        steps = MAX_RMT_STEPS;
-    rmt_item32_t items[MAX_RMT_STEPS];
+static void generate_motion_block(uint32_t steps, int32_t accel_sign, bool dir) {
+    if (steps == 0) return;
+    if (steps > MAX_RMT_STEPS) steps = MAX_RMT_STEPS;
+
+    const uint32_t min_period = (uint32_t)(1000000.0f / MAX_SPEED);
+
+    float speed = fabsf((float)currentSpeed);
+    if (speed < 1.0f) speed = 1.0f; // only for starting from 0
 
     for (uint32_t i = 0; i < steps; i++) {
-        items[i].level0 = 1;
-        items[i].duration0 = highTime; // HIGH pulse duration
-        items[i].level1 = 0;
-        items[i].duration1 = lowTime; // LOW pulse duration
+        uint32_t period = Hz2Us((uint32_t)speed);
+        if (period < min_period) period = min_period;
+
+        rmt_buffer[i].level0 = 1;
+        rmt_buffer[i].duration0 = PULSE_HIGH_TIME_US;
+        rmt_buffer[i].level1 = 0;
+        rmt_buffer[i].duration1 = period - PULSE_HIGH_TIME_US;
+
+        // update speed per step
+        if (accel_sign != 0) {
+            speed += (float)accel_sign / speed;
+
+            if (speed < 0.0f) speed = 0.0f; // allow full stop
+            if (speed > MAX_SPEED) speed = MAX_SPEED;
+        }
     }
 
-    rmt_write_items(RMT_CH, items, steps, false); // Write the pulse sequence to the RMT channel
-    bool direction = (target_position - current_position) > 0;
-    current_position += direction ? steps : -steps; // Update the current position based on the direction of movement
+    currentSpeed = dir ? (int32_t)speed : -(int32_t)speed;
+
+    // stop running if speed reached 0
+    if (currentSpeed == 0)
+        running = false;
+    else
+        running = true;
+
+    if (rmt_write_items(RMT_CH, rmt_buffer, steps, false) == ESP_OK) {
+        motionBlockDone = false;
+    } else {
+        running = false;
+        currentSpeed = 0;
+        motionBlockDone = true;
+    }
 }
 
 void setDirection(bool dir) {
@@ -56,73 +83,10 @@ void setDirection(bool dir) {
     }
 }
 
-static inline uint32_t stopping_distance(int32_t speed) {
-    int32_t v = abs(speed);
-    return (v * v) / (2 * DECELERATION);
-}
-
-uint32_t Update_Speed(int32_t remainingSteps) {
-    int32_t dir = (remainingSteps > 0) ? 1 : -1;
-
-    // int32_t target_speed =
-    //     map(remainingSteps,
-    //         // map(abs(remainingSteps),
-    //         0,
-    //         STEPS_PER_REV,
-    //         MIN_SPEED,
-    //         MAX_SPEED);
-
-    // int32_t target_speed = (MAX_SPEED - MIN_SPEED) / STEPS_PER_REV * abs(remainingSteps) + MIN_SPEED;
-    int32_t target_speed = ((int64_t)abs(remainingSteps) * (MAX_SPEED - MIN_SPEED)) / MAX_SPEED + MIN_SPEED;
-
-    // Serial.printf("Remaining steps: %d | Target speed: %d steps/s\n", remainingSteps, target_speed);
-
-    target_speed = constrain(target_speed, MIN_SPEED, MAX_SPEED);
-
-    // signed target velocity
-    int32_t targetVelocity = target_speed * dir;
-
-    // low-pass velocity filter (motion smoothing)
-    int32_t filter = 50;
-    currentSpeed =
-        (currentSpeed * (filter - 1) + targetVelocity) / filter;
-
-    // deadband near stop
-    if (abs(remainingSteps) < 2)
-        currentSpeed = 0;
-
-    return abs(currentSpeed);
-}
-
-uint32_t Update_Speed2(int32_t remainingSteps) {
-    int32_t dir = (remainingSteps > 0) ? 1 : -1;
-
-    int32_t distance = abs(remainingSteps);
-
-    uint32_t stopDist = stopping_distance(currentSpeed);
-
-    // ---- DECELERATION PHASE ----
-    if (stopDist >= distance) {
-        if (currentSpeed > 0)
-            currentSpeed -= DECELERATION;
-        else if (currentSpeed < 0)
-            currentSpeed += DECELERATION;
-    }
-    // ---- ACCELERATION PHASE ----
-    else {
-        currentSpeed += dir * ACCELERATION;
-    }
-
-    // clamp
-    if (currentSpeed > MAX_SPEED) currentSpeed = MAX_SPEED;
-    if (currentSpeed < -MAX_SPEED) currentSpeed = -MAX_SPEED;
-
-    // avoid deadband stall
-    if (currentSpeed != 0 &&
-        abs(currentSpeed) < MIN_SPEED)
-        currentSpeed = dir * MIN_SPEED;
-
-    return abs(currentSpeed);
+// stopping distance in steps
+static inline uint32_t steps_to_stop(int32_t speed) {
+    uint32_t v = abs(speed);
+    return (uint64_t)v * v / (2 * ACCELERATION);
 }
 
 void update_current_position(int32_t *current_position) {
@@ -144,27 +108,70 @@ void update_current_position(int32_t *current_position) {
     lastStepCount = StepCount;
 }
 
-void move_toward_target() {
-    int32_t stepsToMove = target_position - current_position;
-    if (stepsToMove != 0) {
-        setDirection(stepsToMove > 0); // Set direction based on whether we need to move forward or backward
-        running = true;                // Set the running flag to indicate we're executing a move
-        moveSteps(abs(stepsToMove));   // Move the required number of steps
+static void move_toward_target() {
+    int32_t dist = target_position - current_position;
+    bool dir = (dist > 0);
+
+    // prevent instant reversal at speed
+    if ((currentSpeed > 0 && !dir) || (currentSpeed < 0 && dir)) {
+        uint32_t block = steps_to_stop(currentSpeed);
+        if (block == 0)
+            block = 1;
+        if (block > MAX_RMT_STEPS)
+            block = MAX_RMT_STEPS;
+
+        bool currentDir = speed_direction_is_positive();
+        generate_motion_block(block, -ACCELERATION, currentDir);
+        apply_position_delta(block, currentDir);
+        return;
+    }
+
+    if (dist != 0) {
+        setDirection(dir);
+
+        uint32_t remaining = abs(dist);
+        uint32_t stop_steps = steps_to_stop(currentSpeed);
+
+        uint32_t block = remaining;
+        if (block > MAX_RMT_STEPS)
+            block = MAX_RMT_STEPS;
+
+        if (stop_steps >= remaining)
+            generate_motion_block(block, DECELERATION, dir); // decel
+        else if (abs(currentSpeed) < MAX_SPEED)
+            generate_motion_block(block, ACCELERATION, dir); // accel
+        else
+            generate_motion_block(block, 0, dir); // cruise
+
+        apply_position_delta(block, dir);
+
+        running = true;
+    } else {
+        // target reached → brake if still moving
+        if (currentSpeed != 0) {
+            uint32_t stop_steps = steps_to_stop(currentSpeed);
+            bool currentDir = speed_direction_is_positive();
+            generate_motion_block(stop_steps, -ACCELERATION, currentDir);
+            apply_position_delta(stop_steps, currentDir);
+            running = true;
+        } else {
+            running = false; // actually stopped
+            currentSpeed = 0;
+        }
     }
 }
+
 /*
 This callback is called by the RMT driver when it finishes transmitting the pulse sequence.
 We use it to check if we've reached the target position and, if not, to continue moving towards the target.
 It is also called in between moves, like to initiate the first move towards the target when we receive a new command in the motion task loop.
 */
-void onRMTTransmissionComplete(rmt_channel_t channel, void *arg) {
-    if (current_position == target_position) {
-        running = false;  // Clear the running flag when we reach the target
-        currentSpeed = 0; // Ensure speed is set to 0 when we reach the target
-    } else {
-        move_toward_target(); // Continue moving towards the target if we haven't reached it yet
+void IRAM_ATTR onRMTTransmissionComplete(rmt_channel_t channel, void *arg) {
+    if (channel == RMT_CH) {
+        motionBlockDone = true;
     }
 }
+
 void motionTask(void *pv) {
     MotionCommand cmd;
 
@@ -186,18 +193,23 @@ void motionTask(void *pv) {
     setupRMT((gpio_num_t)PULSE_PIN, RMT_CH, onRMTTransmissionComplete); // Initialize the RMT peripheral for generating step pulses
     setupStepCounter((gpio_num_t)PULSE_WATCH_PIN, (gpio_num_t)DIR_WATCH_PIN);
     //-----------------------------------------------
-
+    bool lastRunning = false;
     for (;;) {
         // update_current_position(&current_position);
+        bool targetChanged = false;
 
         if (xQueueReceive(motionQueue, &cmd, 0) == pdTRUE) {
             target_position = cmd.target;
+            targetChanged = true;
         }
-        // move_toward_target();
-        if (!running) {
-            onRMTTransmissionComplete(RMT_CH, NULL); // Manually call the RMT transmission complete callback to start the motion towards the target. In a real implementation, this would be triggered by the RMT hardware when it finishes sending pulses.
+        if (lastRunning != running) {
+            Serial.printf("Running: %s\n", running ? "Yes" : "No");
+            lastRunning = running;
         }
-        // runMotionPlanner(target);
+
+        if (motionBlockDone || (!running && targetChanged)) {
+            move_toward_target();
+        }
 
         static int i = 0;
         if (i++ % 100 == 0) {

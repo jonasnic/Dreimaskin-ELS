@@ -8,7 +8,7 @@
 #include "mqtt_manager.h"
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(500000);
 
     initQueues();
 
@@ -19,7 +19,7 @@ void setup() {
     xTaskCreatePinnedToCore(
         motionTask,
         "motion",
-        4096,
+        8192,
         NULL,
         3,
         NULL,

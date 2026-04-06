@@ -4,4 +4,3 @@
 
 // Converts frequency in Hz to pulse period in microseconds
 uint32_t Hz2Us(uint32_t frequency);
-void set_direction(bool direction);
