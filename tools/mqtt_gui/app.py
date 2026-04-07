@@ -3,20 +3,33 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox
+from collections import deque
 
 import paho.mqtt.client as mqtt
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 
 class MqttGuiApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Dreimaskin MQTT Control")
-        self.root.geometry("820x560")
+        self.root.geometry("1200x800")
 
         self.event_queue = queue.Queue()
         self.client = None
         self.connected = False
         self.connecting = False
+
+        # Data history for plotting (keep last 300 samples)
+        self.max_history = 300
+        self.timestamps = deque(maxlen=self.max_history)
+        self.speed_history = deque(maxlen=self.max_history)
+        self.position_history = deque(maxlen=self.max_history)
+        self.target_history = deque(maxlen=self.max_history)
+        self.distance_history = deque(maxlen=self.max_history)
+        self.sample_time = time.time()
 
         self._build_ui()
         self._poll_events()
@@ -92,6 +105,32 @@ class MqttGuiApp:
         self._status_row(status_frame, 3, "Mode", self.mode_status_var)
         self._status_row(status_frame, 4, "Alive", self.alive_var)
 
+        # Create plot frames
+        plots_frame = ttk.LabelFrame(main, text="Graphs", padding=10)
+        plots_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        plots_frame.columnconfigure(0, weight=1)
+        plots_frame.columnconfigure(1, weight=1)
+
+        # Speed plot
+        self.fig_speed = Figure(figsize=(4.5, 3), dpi=100)
+        self.ax_speed = self.fig_speed.add_subplot(111)
+        self.ax_speed.set_title("Speed")
+        self.ax_speed.set_xlabel("Time (samples)")
+        self.ax_speed.set_ylabel("Speed")
+        self.fig_speed.tight_layout()
+        self.canvas_speed = FigureCanvasTkAgg(self.fig_speed, master=plots_frame)
+        self.canvas_speed.get_tk_widget().grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 5))
+
+        # Position, Target, Distance plot
+        self.fig_motion = Figure(figsize=(4.5, 3), dpi=100)
+        self.ax_motion = self.fig_motion.add_subplot(111)
+        self.ax_motion.set_title("Position, Target, Distance to Target")
+        self.ax_motion.set_xlabel("Time (samples)")
+        self.ax_motion.set_ylabel("Units")
+        self.fig_motion.tight_layout()
+        self.canvas_motion = FigureCanvasTkAgg(self.fig_motion, master=plots_frame)
+        self.canvas_motion.get_tk_widget().grid(row=0, column=1, sticky=tk.NSEW, padx=(5, 0))
+
         log_frame = ttk.LabelFrame(main, text="Log", padding=10)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
@@ -107,6 +146,37 @@ class MqttGuiApp:
         card = ttk.LabelFrame(frame, text=title, padding=10)
         card.grid(row=0, column=column, padx=4, sticky=tk.EW)
         ttk.Label(card, textvariable=var, anchor=tk.CENTER, font=("TkDefaultFont", 16, "bold")).pack(fill=tk.X)
+
+    def _update_plots(self):
+        """Redraw both graphs with current history data."""
+        # Update speed plot
+        self.ax_speed.clear()
+        if self.speed_history:
+            self.ax_speed.plot(list(self.speed_history), label="Speed", color="blue", linewidth=1.5)
+            self.ax_speed.legend()
+        self.ax_speed.set_title("Speed")
+        self.ax_speed.set_xlabel("Time (samples)")
+        self.ax_speed.set_ylabel("Speed")
+        self.ax_speed.grid(True, alpha=0.3)
+        self.fig_speed.tight_layout()
+        self.canvas_speed.draw_idle()
+
+        # Update motion plot
+        self.ax_motion.clear()
+        if self.position_history:
+            self.ax_motion.plot(list(self.position_history), label="Position", color="green", linewidth=1.5)
+        if self.target_history:
+            self.ax_motion.plot(list(self.target_history), label="Target", color="red", linewidth=1.5, linestyle="--")
+        if self.distance_history:
+            self.ax_motion.plot(list(self.distance_history), label="Distance to Target", color="orange", linewidth=1.5, linestyle=":")
+        if self.position_history or self.target_history or self.distance_history:
+            self.ax_motion.legend()
+        self.ax_motion.set_title("Position, Target, Distance to Target")
+        self.ax_motion.set_xlabel("Time (samples)")
+        self.ax_motion.set_ylabel("Units")
+        self.ax_motion.grid(True, alpha=0.3)
+        self.fig_motion.tight_layout()
+        self.canvas_motion.draw_idle()
 
     def log(self, msg):
         self.log_text.configure(state=tk.NORMAL)
@@ -266,19 +336,43 @@ class MqttGuiApp:
                 topic = evt[1]
                 payload = evt[2]
                 t = self.topics()
+                plots_updated = False
 
                 if topic == t["status_pos"]:
                     self.position_var.set(payload)
+                    try:
+                        self.position_history.append(float(payload))
+                        plots_updated = True
+                    except ValueError:
+                        pass
                 elif topic == t["status_speed"]:
                     self.speed_var.set(payload)
+                    try:
+                        self.speed_history.append(float(payload))
+                        plots_updated = True
+                    except ValueError:
+                        pass
                 elif topic == t["status_target"]:
                     self.target_status_var.set(payload)
+                    try:
+                        self.target_history.append(float(payload))
+                        plots_updated = True
+                    except ValueError:
+                        pass
                 elif topic == t["status_distance"]:
                     self.distance_to_target_var.set(payload)
+                    try:
+                        self.distance_history.append(float(payload))
+                        plots_updated = True
+                    except ValueError:
+                        pass
                 elif topic == t["status_mode"]:
                     self.mode_status_var.set(payload)
                 elif topic == t["status_alive"]:
                     self.alive_var.set(payload)
+
+                if plots_updated:
+                    self._update_plots()
 
         self.root.after(50, self._poll_events)
 
