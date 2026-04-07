@@ -3,6 +3,29 @@
 #include "ui_task.h"
 #include "mqtt_manager.h"
 
+namespace {
+
+bool parseModeCommand(const char* text, MotionMode* mode)
+{
+    if (text == nullptr || mode == nullptr) {
+        return false;
+    }
+
+    if (strcmp(text, "mode position") == 0 || strcmp(text, "mode move") == 0) {
+        *mode = MOTION_MODE_POSITION;
+        return true;
+    }
+
+    if (strcmp(text, "mode follow") == 0) {
+        *mode = MOTION_MODE_FOLLOW;
+        return true;
+    }
+
+    return false;
+}
+
+}
+
 void uiTask(void *pv)
 {
     MotionCommand cmd;
@@ -35,35 +58,56 @@ void uiTask(void *pv)
             incomingString[sizeof(incomingString) - 1] = '\0'; // Ensure null-termination
             Serial.print("Received command: ");
             Serial.println(incomingString);
-            target = atoi(incomingString);
 
-            cmd.cmd = 1;
-            cmd.target = target;
-            cmd.speed = 2000;
+            MotionMode mode;
+            if (parseModeCommand(incomingString, &mode)) {
+                cmd = {};
+                cmd.cmd = MOTION_CMD_SET_MODE;
+                cmd.mode = (uint8_t)mode;
+                xQueueSend(motionQueue, &cmd, 0);
+                publishMotionMode(mode);
+            } else {
+                target = atoi(incomingString);
 
-            xQueueSend(motionQueue, &cmd, 0);
-            publishTargetStatus(target);
+                cmd = {};
+                cmd.cmd = MOTION_CMD_SET_TARGET;
+                cmd.target = target;
+                cmd.speed = 2000;
+
+                xQueueSend(motionQueue, &cmd, 0);
+                publishTargetStatus(target);
+            }
         }
 
-        MotionData data;
+        MotionData motionData;
         static int32_t lastPosition = 0;
         static int32_t lastSpeed = 0;
 
-        if(xQueueReceive(UIQueue, &data, 0) == pdTRUE) {
-            if(data.type == POSITION && data.value.position != lastPosition) {
+        if(xQueueReceive(UIQueue, &motionData, 0) == pdTRUE) {
+            publishMotionData(motionData);
+
+            if(motionData.type == POSITION && motionData.value.position != lastPosition) {
 
                 Serial.print("Current_Position:");
-                Serial.println(data.value.position);
-                lastPosition = data.value.position;
+                Serial.println(motionData.value.position);
+                lastPosition = motionData.value.position;
             }
-            else if(data.type == SPEED && data.value.speed != lastSpeed) {
+            else if(motionData.type == SPEED && motionData.value.speed != lastSpeed) {
                 Serial.print("Current_Speed:");
-                Serial.println(data.value.speed);
-                lastSpeed = data.value.speed;
+                Serial.println(motionData.value.speed);
+                lastSpeed = motionData.value.speed;
+            }
+            else if(motionData.type == DIRECTION) {
+                Serial.print("Current_Direction:");
+                Serial.println(motionData.value.direction ? "Positive" : "Negative");
+            }
+            else if(motionData.type == DISTANCE_TO_TARGET) {
+                Serial.print("Distance_to_Target:");
+                Serial.println(motionData.value.distance_to_target);
             }
 
+
             // Publish to MQTT if connected (data cycles through position and speed)
-            publishMotionStatus(lastPosition, lastSpeed);
 
         }
         vTaskDelay(5);

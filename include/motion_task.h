@@ -20,7 +20,7 @@
 #define AXEL_PITCH 5.0                                          // mm movement per revolution of the axel (e.g., for a lead screw with 5mm pitch)
 #define STEPS_PER_MM ((STEPS_PER_REV * BELTRATIO) / AXEL_PITCH) // Steps per millimeter of linear movement
 
-#define PULSE_HIGH_TIME_US 2
+#define PULSE_HIGH_TIME_US 4
 
 #define RMT_CH RMT_CHANNEL_0
 uint32_t Hz2Us(uint32_t speedInHz);
