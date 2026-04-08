@@ -6,8 +6,8 @@
 #define BUFFERS_COUNT 2
 
 #define RMT_CLK_DIV 4
-#define RMT_TICK_1US (CPU_CLK_FREQ / RMT_CLK_DIV / 1000000)
-#define RMT_TICK_1MS (RMT_TICK_1US * 1000)
+#define RMT_TICKS_1US (80 / RMT_CLK_DIV)
+#define RMT_TICK_1MS (RMT_TICKS_1US * 1000)
 #define RMT_TICK_1S (RMT_TICK_1MS * 1000)
 
 
@@ -18,6 +18,7 @@
 
 typedef struct {
     uint32_t steps_done;   // number of steps just transmitted
+    bool standing_still;   // true if the RMT just finished transmitting a buffer with 0 steps (used to detect end of motion)
 } rmt_callback_arg_t;
 
 // User callback hook (called from ISR)
@@ -29,8 +30,7 @@ extern void (*rmt_user_callback)(rmt_callback_arg_t *arg);
 // ============================================================
 void setupRMT(
     gpio_num_t pulsePin, 
-    rmt_channel_t channel, 
-    rmt_tx_end_fn_t tx_end_callback);
+    rmt_channel_t channel);
 void startRMT();
 
 // fills the next buffer with pulses + nopulses (internal buffer access)
