@@ -6,28 +6,26 @@
 #include "step_counter.h"
 #include "utils.h"
 
-volatile int32_t target_position = 0;
-volatile int32_t current_position = 0;
+volatile int32_t target_position_stepp = 0; //meassured in steps, can be positive or negative depending on direction
+volatile int32_t current_position_stepp = 0; //meassured in steps, can be positive or negative depending on direction
 volatile bool running = false;   // Flag to indicate if the motion task is currently executing a move. will use to know if ISR are in effect or not
-static int32_t currentSpeed = 0; // signed steps/sec
+static int32_t current_speed_Hz = 0; // signed steps/sec
 static volatile bool motionBlockDone = true;
 static TaskHandle_t motionTaskHandle = NULL;
 static MotionMode motionMode = MOTION_MODE_POSITION;
-static constexpr float kMaxSpeedDeltaPerBatch = 3000.0f;
-static constexpr uint32_t kMaxPulsePeriodUs = 2000;
 
-// Ping-pong buffers reduce gaps by avoiding write/read contention on the same buffer.
-static rmt_item32_t rmt_buffers[2][MAX_RMT_STEPS];
-static uint8_t activeBufferIndex = 1;
+static constexpr float kMaxSpeedDeltaPerBatch = 3000.0f;
+
+
+void report_data() ;
 
 struct MotionBatch {
-    uint8_t bufferIndex;
     uint16_t steps;
+    uint32_t frequencyHz;
     bool dir;
     int32_t endSpeed;
     bool valid;
 };
-
 static MotionBatch pendingBatch = {};
 
 static bool uses_preplanned_batches() {
@@ -35,42 +33,22 @@ static bool uses_preplanned_batches() {
 }
 
 static bool speed_direction_is_positive() {
-    return currentSpeed >= 0;
+    return current_speed_Hz >= 0;
 }
 
 static void apply_position_delta(uint32_t steps, bool dir) {
     if (dir)
-        current_position += steps;
+        current_position_stepp += steps;
     else
-        current_position -= steps;
+        current_position_stepp -= steps;
 }
 
-static uint8_t choose_buffer_index() {
-    return activeBufferIndex ^ 1;
-}
-
-static bool build_motion_batch(uint8_t bufferIndex, uint32_t steps, int32_t accel_sign, bool dir, int32_t startSpeed, MotionBatch *batch) {
+static bool build_motion_batch(uint32_t steps, int32_t accel_sign, bool dir, int32_t startSpeed, MotionBatch *batch) {
     if (steps == 0 || batch == NULL) return false;
     if (steps > MAX_RMT_STEPS) steps = MAX_RMT_STEPS;
 
-    const uint32_t min_period = (uint32_t)(1000000.0f / MAX_SPEED);
-
     float speed_start = fabsf((float)startSpeed);
     if (speed_start < 1.0f) speed_start = 1.0f; // only for starting from 0
-
-    rmt_item32_t *buffer = rmt_buffers[bufferIndex];
-
-    // Constant pulse period for this whole batch; speed is updated once after the batch.
-    uint32_t period = Hz2Us((uint32_t)speed_start);
-    if (period > kMaxPulsePeriodUs) period = kMaxPulsePeriodUs;
-    if (period < min_period) period = min_period;
-
-    for (uint32_t i = 0; i < steps; i++) {
-        buffer[i].level0 = 1;
-        buffer[i].duration0 = PULSE_HIGH_TIME_US;
-        buffer[i].level1 = 0;
-        buffer[i].duration1 = period - PULSE_HIGH_TIME_US;
-    }
 
     float speed_end = speed_start;
     if (accel_sign != 0) {
@@ -84,8 +62,8 @@ static bool build_motion_batch(uint8_t bufferIndex, uint32_t steps, int32_t acce
     if (speed_end < 0.0f) speed_end = 0.0f;
     if (speed_end > MAX_SPEED) speed_end = MAX_SPEED;
 
-    batch->bufferIndex = bufferIndex;
     batch->steps = (uint16_t)steps;
+    batch->frequencyHz = (uint32_t)speed_start;
     batch->dir = dir;
     batch->endSpeed = dir ? (int32_t)speed_end : -(int32_t)speed_end;
     batch->valid = true;
@@ -93,36 +71,18 @@ static bool build_motion_batch(uint8_t bufferIndex, uint32_t steps, int32_t acce
 }
 
 static bool submit_motion_batch(const MotionBatch &batch) {
-    setDirection(batch.dir);
+    setDirection(batch.dir,current_speed_Hz);
 
-    if (rmt_write_items(RMT_CH, rmt_buffers[batch.bufferIndex], batch.steps, false) == ESP_OK) {
-        activeBufferIndex = batch.bufferIndex;
-        currentSpeed = batch.endSpeed;
-        apply_position_delta(batch.steps, batch.dir);
-        motionBlockDone = false;
-        running = true;
-        return true;
-    } else {
-        running = false;
-        currentSpeed = 0;
-        motionBlockDone = true;
-        return false;
-    }
+    loadNextBufferHz(batch.steps, batch.frequencyHz);
+
+    current_speed_Hz = batch.endSpeed;
+    apply_position_delta(batch.steps, batch.dir);
+    motionBlockDone = false;
+    running = true;
+    return true;
 }
 
-void setDirection(bool dir) {
-    static bool currentDir = digitalRead(DIR_PIN); // Read the initial direction from the DIR pin
 
-    if (currentDir != dir) {
-        if (currentSpeed == 0) {
-            // If we're currently moving, we need to stop before changing direction
-
-            digitalWrite(DIR_PIN, dir);
-            delayMicroseconds(50); // REQUIRED
-            currentDir = dir;
-        }
-    }
-}
 
 // stopping distance in steps
 static inline uint32_t steps_to_stop(int32_t speed) {
@@ -133,7 +93,7 @@ static inline uint32_t steps_to_stop(int32_t speed) {
 static bool plan_motion_batch(int32_t planPosition, int32_t planSpeed, MotionBatch *batch) {
     if (batch == NULL) return false;
 
-    int32_t dist = target_position - planPosition;
+    int32_t dist = target_position_stepp - planPosition;
     uint32_t remaining = abs(dist);
     bool dir = (dist > 0);
 
@@ -151,7 +111,7 @@ static bool plan_motion_batch(int32_t planPosition, int32_t planSpeed, MotionBat
             block = MAX_RMT_STEPS;
 
         bool currentDir = planSpeed >= 0;
-        return build_motion_batch(choose_buffer_index(), block, -ACCELERATION, currentDir, planSpeed, batch);
+        return build_motion_batch(block, -ACCELERATION, currentDir, planSpeed, batch);
     }
 
     uint32_t stop_steps = steps_to_stop(planSpeed);
@@ -161,17 +121,17 @@ static bool plan_motion_batch(int32_t planPosition, int32_t planSpeed, MotionBat
         block = MAX_RMT_STEPS;
 
     if (stop_steps >= remaining)
-        return build_motion_batch(choose_buffer_index(), block, DECELERATION, dir, planSpeed, batch);
+        return build_motion_batch(block, DECELERATION, dir, planSpeed, batch);
     if (abs(planSpeed) < MAX_SPEED)
-        return build_motion_batch(choose_buffer_index(), block, ACCELERATION, dir, planSpeed, batch);
-    return build_motion_batch(choose_buffer_index(), block, 0, dir, planSpeed, batch);
+        return build_motion_batch(block, ACCELERATION, dir, planSpeed, batch);
+    return build_motion_batch(block, 0, dir, planSpeed, batch);
 }
 
 static void queue_next_motion_batch() {
     MotionBatch batch = {};
-    if (!plan_motion_batch(current_position, currentSpeed, &batch)) {
+    if (!plan_motion_batch(current_position_stepp, current_speed_Hz, &batch)) {
         running = false;
-        currentSpeed = 0;
+        current_speed_Hz = 0;
         return;
     }
 
@@ -184,7 +144,7 @@ static void prepare_pending_batch() {
     }
 
     MotionBatch batch = {};
-    if (!plan_motion_batch(current_position, currentSpeed, &batch)) {
+    if (!plan_motion_batch(current_position_stepp, current_speed_Hz, &batch)) {
         return;
     }
 
@@ -196,15 +156,14 @@ This callback is called by the RMT driver when it finishes transmitting the puls
 We use it to check if we've reached the target position and, if not, to continue moving towards the target.
 It is also called in between moves, like to initiate the first move towards the target when we receive a new command in the motion task loop.
 */
-void IRAM_ATTR onRMTTransmissionComplete(rmt_channel_t channel, void *arg) {
-    if (channel == RMT_CH) {
-        motionBlockDone = true;
-        if (motionTaskHandle != NULL) {
-            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-            vTaskNotifyGiveFromISR(motionTaskHandle, &xHigherPriorityTaskWoken);
-            if (xHigherPriorityTaskWoken == pdTRUE) {
-                portYIELD_FROM_ISR();
-            }
+void IRAM_ATTR onRMTTransmissionComplete(rmt_callback_arg_t *arg) {
+    
+    motionBlockDone = true;
+    if (motionTaskHandle != NULL) {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        vTaskNotifyGiveFromISR(motionTaskHandle, &xHigherPriorityTaskWoken);
+        if (xHigherPriorityTaskWoken == pdTRUE) {
+            portYIELD_FROM_ISR();
         }
     }
 }
@@ -214,9 +173,6 @@ void motionTask(void *pv) {
 
     MotionCommand cmd;
 
-    //-------- For sending data to the UI task --------
-    MotionData motionData;
-
     //-----------------------------------------------
 
     //---------Seting the pins and peripherals---------
@@ -225,37 +181,47 @@ void motionTask(void *pv) {
     pinMode(DIR_PIN, OUTPUT);
     pinMode(ENABLE_PIN, OUTPUT);
 
-    setupEncoder();                                                     // Initialize the encoder interface
-    setupRMT((gpio_num_t)PULSE_PIN, RMT_CH, onRMTTransmissionComplete); // Initialize the RMT peripheral for generating step pulses
+    setupEncoder(); // Initialize the encoder interface
+    
+    
+    rmt_user_callback = onRMTTransmissionComplete;
+    setupRMT((gpio_num_t)PULSE_PIN, RMT_CH); // Initialize the RMT peripheral for generating step pulses
+    // delay(10000); // Short delay to ensure RMT is set up before we start sending pulses
+    startRMT();
+
+    // printRMTBuffer(0);
+    // printRMTBuffer(1);
+    // delay(100000); // Short delay to ensure RMT is running before we start sending pulses
     setupStepCounter((gpio_num_t)PULSE_WATCH_PIN, (gpio_num_t)DIR_WATCH_PIN);
+    
     //-----------------------------------------------
     bool lastRunning = false;
-    uint8_t motionReportingIndex = 0;
-    MotionDataType lastDataType = POSITION;
+    
+    
     for (;;) {
-        bool targetChanged = false;
+        static bool targetChanged = false;
 
+        
+        // Check for new motion commands from the motionQueue / UI task
         if (xQueueReceive(motionQueue, &cmd, 0) == pdTRUE) {
             if (cmd.cmd == MOTION_CMD_SET_MODE) {
                 motionMode = (cmd.mode == MOTION_MODE_FOLLOW) ? MOTION_MODE_FOLLOW : MOTION_MODE_POSITION;
                 pendingBatch.valid = false;
                 Serial.printf("Motion mode: %s\n", motionMode == MOTION_MODE_FOLLOW ? "follow" : "position");
             } else {
-                target_position = cmd.target;
+                target_position_stepp = cmd.target;
                 targetChanged = true;
                 pendingBatch.valid = false;
 
                 if (!running && motionBlockDone) {
-                    currentSpeed = 0;
+                    current_speed_Hz = 0;
                 }
             }
         }
-        if (lastRunning != running) {
-            Serial.printf("Running: %s\n", running ? "Yes" : "No");
-            lastRunning = running;
-        }
-
+        
+        // if IRS has completed the current motion batch, we check if we need to queue the next batch to continue moving towards the target or if we can stop because we've reached the target
         if (motionBlockDone) {
+            //
             if (uses_preplanned_batches() && pendingBatch.valid) {
                 MotionBatch batch = pendingBatch;
                 pendingBatch.valid = false;
@@ -268,18 +234,43 @@ void motionTask(void *pv) {
         }
 
         prepare_pending_batch();
+        report_data();
 
-        if (motionReportingIndex++ == 0) {
+
+        // Sleep until TX complete notification or timeout; notify path minimizes inter-block gap.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+void report_data() {
+static uint8_t motionReportingIndex = 0;
+
+    //-------- For sending data to the UI task --------
+    MotionData motionData;
+    static MotionDataType lastDataType = POSITION;
+    
+    if (motionReportingIndex++ == 0) {
+
             if (motionReportingIndex > 50) motionReportingIndex = 0;
             motionData.type = lastDataType;
 
             switch (lastDataType) {
             case POSITION:
-                motionData.value.position = current_position;
+                motionData.value.position = current_position_stepp;
                 xQueueSend(UIQueue, &motionData, 0);
                 break;
             case SPEED:
-                motionData.value.speed = currentSpeed;
+                motionData.value.speed = current_speed_Hz;
                 xQueueSend(UIQueue, &motionData, 0);
                 break;
             case DIRECTION:
@@ -288,11 +279,11 @@ void motionTask(void *pv) {
                 break;
 
             case DISTANCE_TO_TARGET:
-                motionData.value.distance_to_target = abs(target_position - current_position);
+                motionData.value.distance_to_target = abs(target_position_stepp - current_position_stepp);
                 xQueueSend(UIQueue, &motionData, 0);
                 break;
             case TARGET_POSITION:
-                motionData.value.position = target_position;
+                motionData.value.position = target_position_stepp;
                 xQueueSend(UIQueue, &motionData, 0);
                 break;
             default:
@@ -300,9 +291,6 @@ void motionTask(void *pv) {
                 break;
             }
             lastDataType = (MotionDataType)((lastDataType + 1) % MOTION_DATA_TYPE_COUNT);
+            
         }
-
-        // Sleep until TX complete notification or timeout; notify path minimizes inter-block gap.
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
     }
-}

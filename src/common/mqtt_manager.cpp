@@ -162,7 +162,7 @@ namespace {
 } // namespace
 
 void startMQTTTask(UBaseType_t priority, BaseType_t core) {
-    xTaskCreatePinnedToCore(
+    BaseType_t created = xTaskCreatePinnedToCore(
         mqttTask,
         "mqtt",
         6144,
@@ -170,6 +170,12 @@ void startMQTTTask(UBaseType_t priority, BaseType_t core) {
         priority,
         nullptr,
         core);
+
+    if (created != pdPASS) {
+        Serial.println("[MQTT] Failed to create MQTT task");
+    } else {
+        Serial.println("[MQTT] MQTT task created");
+    }
 }
 
 bool isMQTTConnected() {
