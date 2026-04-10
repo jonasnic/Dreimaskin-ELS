@@ -1,5 +1,6 @@
 // rmt_setup.cpp - Implementation of RMT setup and control functions
 #include "rmt_setup.h"
+#include "bitpattern_table.h"
 #include "driver/rmt.h"
 #include <Arduino.h>
 
@@ -9,38 +10,42 @@ static volatile uint8_t currentTxBufferIndex = 0;
 static volatile uint8_t nextWriteBufferIndex = 0;
 static volatile uint32_t steps_in_buffer[BUFFERS_COUNT] = {0, 0};
 
-
-DRAM_ATTR static const rmt_item32_t nopulse_item = RMT_ITEM(RMT_TICKS_1US, 0, RMT_TICKS_1US, 0);
+DRAM_ATTR static const rmt_item32_t nopulse_item = RMT_ITEM(NOPULS_LENGTH_TICKS / 2, 0, NOPULS_LENGTH_TICKS / 2, 0);
 DRAM_ATTR static const rmt_item32_t pulse_item_template = RMT_ITEM(RMT_HIGH_PULSE_TICKS, 1, RMT_TICKS_1US * 198, 0);
 
 // User callback hook (motion.cpp sets this)
 void (*rmt_user_callback)(rmt_callback_arg_t *arg) = nullptr;
 
+uint64_t BitPatternPrCount(uint32_t count);
+
 // ------------------ Internal helpers ------------------
-static void IRAM_ATTR fill_buffer_with_steps_items(uint32_t buf_index, uint32_t count, uint32_t low_tics) {
+static void IRAM_ATTR fill_buffer_with_steps_items(uint32_t buf_index, uint32_t count, int32_t low_tics) {
+    if (count == 0) {
+        // if no steps, just fill with nopulse items to detect end of motion
+        // already done in ISR, so nothing to do here
+        return;
+    }
+
     volatile rmt_item32_t *buf = rmt_buffers[buf_index];
+    uint8_t noPulseItems = RMT_STEPS_PER_BUFFER - count;
+    float noPulseBetweenItems = noPulseItems / (count);
 
-    for (uint32_t i = 0; i < count; i++) {
-        buf[i].val = pulse_item_template.val;
-        buf[i].duration1 = low_tics; // can still modify
-    }
-
-    for (uint32_t i = count; i < RMT_STEPS_PER_BUFFER; i++) {
-        buf[i].val = nopulse_item.val;
-    }
-}
-
-// fill next buffer with individual low_ticks values
-// low_ticks_array should have at least 'count' elements
-static void IRAM_ATTR fill_buffer_with_steps_items_array(uint32_t buf_index, uint32_t count, const uint32_t *low_ticks_array) {
-    volatile rmt_item32_t *buf = rmt_buffers[buf_index];
-
-    for (uint32_t i = 0; i < count; i++) {
-        buf[i].val = pulse_item_template.val;
-        buf[i].duration1 = low_ticks_array[i];
-    }
-    for (uint32_t i = count; i < RMT_STEPS_PER_BUFFER; i++) {
-        buf[i].val = nopulse_item.val;
+    float counterNoPulse = 0;
+    uint32_t noPulsesAdded = 0;
+    for (uint32_t i = 0; i < RMT_STEPS_PER_BUFFER; i++) {
+        if (counterNoPulse >= 1.0f) {
+            // buf[i].val = nopulse_item.val; // already done in ISR
+            counterNoPulse -= 1.0f;
+            noPulsesAdded++;
+            continue;
+        } else {
+            buf[i].val = pulse_item_template.val;
+            buf[i].duration1 = low_tics - noPulsesAdded * NOPULS_LENGTH_TICKS; // compensate for the extra time added by nopulse items, to keep the overall timing correct
+            if (buf[i].duration1 < 0) {
+                buf[i].duration1 = 1; // just in case, to avoid underflow
+            }
+            counterNoPulse += noPulseBetweenItems;
+        }
     }
 }
 
@@ -56,8 +61,8 @@ static void prefill_nopulse_items() {
     }
 }
 
-//MARK: ISR
-// ------------------ ISR ------------------
+// MARK: ISR
+//  ------------------ ISR ------------------
 void IRAM_ATTR rmt_tx_end_isr(void *arg) {
     // const uint8_t dbg = 23; // GPIO pin for debugging the ISR timing (optional)
     // static bool  dbgstat;
@@ -67,14 +72,14 @@ void IRAM_ATTR rmt_tx_end_isr(void *arg) {
     // Check which interrupt fired and clear it; ignore if not our channel's threshold event
     const uint32_t thr_bit = 1u << (24 + RMT_CH);
     if (!(RMT.int_st.val & thr_bit)) return;
-    
+
     RMT.int_clr.val = thr_bit;
 
     uint32_t steps_done = steps_in_buffer[currentTxBufferIndex];
 
     // clear the just-transmitted buffer to avoid ghost steps if we ever read from it again before filling
     volatile rmt_item32_t *buf = rmt_buffers[currentTxBufferIndex];
-    for (uint32_t i = 0; i < steps_done; i++) {
+    for (uint32_t i = 0; i < RMT_STEPS_PER_BUFFER; i++) {
         buf[i].val = nopulse_item.val;
     }
 
@@ -90,11 +95,11 @@ void IRAM_ATTR rmt_tx_end_isr(void *arg) {
     }
 }
 
-//MARK: SETUP
-// ------------------ Public functions ------------------
+// MARK: SETUP
+//  ------------------ Public functions ------------------
 void setupRMT(gpio_num_t pulsePin, rmt_channel_t channel) {
-    pinMode((uint8_t)pulsePin, OUTPUT);
     digitalWrite((uint8_t)pulsePin, LOW);
+    pinMode((uint8_t)pulsePin, OUTPUT);
     // pinMode(23, OUTPUT); // Debug pin for ISR timing
 
     rmt_config_t config = {};
@@ -117,7 +122,7 @@ void setupRMT(gpio_num_t pulsePin, rmt_channel_t channel) {
     // point buffers to hardware memory
     // rmt_memory = RMTMEM.chan[channel].data32;
     rmt_buffers[0] = RMTMEM.chan[channel].data32;
-    rmt_buffers[1] = RMTMEM.chan[channel+1].data32; // next block for ping-pong
+    rmt_buffers[1] = RMTMEM.chan[channel + 1].data32; // next block for ping-pong
 }
 
 void startRMT() {
@@ -135,15 +140,34 @@ void startRMT() {
     RMT.conf_ch[RMT_CH].conf1.tx_start = 1;
 }
 
+// MARK: Buffer loading
 void IRAM_ATTR loadNextBuffer(uint32_t count, uint32_t low_tics) {
     const uint32_t write_buffer = nextWriteBufferIndex;
+    if (count != 0) {
+        uint64_t puls_pattern = kBitPatterns[count - 1]; // get the bit pattern for the given count from the table for uniform distribution of pulses in the buffer
+        uint8_t noPulsCounter = 0;
+        for (uint32_t i = 0; i < RMT_STEPS_PER_BUFFER; i++) {
+            if ((puls_pattern & (1ULL << (63 - i))) != 0) {
+                rmt_buffers[write_buffer][i].val = pulse_item_template.val;
+                int32_t adjusted_low_tics = low_tics - noPulsCounter * NOPULS_LENGTH_TICKS;
+                if (adjusted_low_tics < 0) {
+                    adjusted_low_tics = 1; // just in case, to avoid underflow
+                }
+                rmt_buffers[write_buffer][i].duration1 = adjusted_low_tics;
+                noPulsCounter = 0;
+            } else {
+                // rmt_buffers[write_buffer][i].val = nopulse_item.val; // already done in ISR
+                noPulsCounter++;
+            }
+        }
+    }
     steps_in_buffer[write_buffer] = count;
-    fill_buffer_with_steps_items(write_buffer, count, low_tics);
+    // fill_buffer_with_steps_items(write_buffer, count, low_tics);
     nextWriteBufferIndex ^= 1;
 }
-
+constexpr uint8_t FREQ_FACTOR = 80 / RMT_CLK_DIV; // conversion factor from frequency in Hz to ticks, based on the RMT clock divider and APB clock
 uint32_t lowTicksFromHz(uint32_t frequency_hz) {
-    uint32_t low_ticks = (1000000 / frequency_hz - 2) * RMT_TICKS_1US; // subtract high pulse duration
+    uint32_t low_ticks = ((1000000 * FREQ_FACTOR) / frequency_hz - RMT_HIGH_PULSE_TICKS); // subtract high pulse duration
     if (low_ticks > 0x7FFF) {
         low_ticks = 0x7FFF; // max duration that fits in 15 bits
     }
@@ -151,36 +175,17 @@ uint32_t lowTicksFromHz(uint32_t frequency_hz) {
 }
 
 void loadNextBufferHz(uint32_t count, uint32_t frequency_hz) {
-    uint32_t low_ticks = lowTicksFromHz(frequency_hz);
-    loadNextBuffer(count, low_ticks);
+    uint32_t low_tics = lowTicksFromHz(frequency_hz);
+    // Serial.printf("Loading buffer with count=%u, frequency=%u Hz, low_ticks=%u\n", count, frequency_hz, low_tics);
+    loadNextBuffer(count, low_tics);
 }
-
-void IRAM_ATTR loadNextBufferWithArray(LowArray array) {
-    const uint32_t write_buffer = nextWriteBufferIndex;
-    steps_in_buffer[write_buffer] = array.count;
-    fill_buffer_with_steps_items_array(write_buffer, array.count, array.low_ticks_array);
-    nextWriteBufferIndex ^= 1;
-}
-
-void loadNextBufferWithArrayHz(LowArray array) {
-    uint32_t low_ticks_array[RMT_STEPS_PER_BUFFER];
-    for (uint32_t i = 0; i < array.count; i++) {
-        low_ticks_array[i] = lowTicksFromHz(array.frequency_hz_array[i]);
-    }
-    LowArray array2 = {
-        .low_ticks_array = low_ticks_array,
-        .count = array.count
-    };
-    loadNextBufferWithArray(array);
-}
-
 
 rmt_item32_t hz2rmt_item(uint32_t frequency_hz) {
     if (frequency_hz == 0) {
         return nopulse_item;
     }
     uint32_t low_ticks = lowTicksFromHz(frequency_hz);
-    
+
     rmt_item32_t item = RMT_ITEM(RMT_HIGH_PULSE_TICKS, 1, low_ticks, 0);
     return item;
 }

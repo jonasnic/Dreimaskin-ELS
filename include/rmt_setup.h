@@ -5,11 +5,12 @@
 #define RMT_STEPS_PER_BUFFER 64
 #define BUFFERS_COUNT 2
 
-#define RMT_CLK_DIV 80 // 1 tick = 1 microsecond at 80 MHz APB clock
+#define RMT_CLK_DIV 4 // 1 tick = 1 microsecond at 80 MHz APB clock
 constexpr uint32_t RMT_TICKS_1US = (80 / RMT_CLK_DIV);
 constexpr uint32_t RMT_TICK_1MS = RMT_TICKS_1US * 1000;
 constexpr uint32_t RMT_TICK_1S = RMT_TICK_1MS * 1000;
 constexpr uint32_t RMT_HIGH_PULSE_TICKS = RMT_TICKS_1US * 4;
+constexpr uint32_t NOPULS_LENGTH_TICKS = 2; // duration of the "no pulse" item in ticks, should be short to minimize delay when we read from a buffer before filling it, but must be > 2 and devisable by 2
 
 // load the uint32_t with the bit pattern for the RMT item with the given parameters
 #define RMT_ITEM(d0, l0, d1, l1) {.val = ((d0) | ((l0) << 15) | ((d1) << 16) | ((l1) << 31))}
@@ -44,4 +45,4 @@ void loadNextBufferWithArray(LowArray array);
 void loadNextBufferHz(uint32_t count, uint32_t frequency_hz);
 void loadNextBufferWithArrayHz(LowArray array);
 rmt_item32_t hz2rmt_item(uint32_t frequency_hz);
-// void printRMTBuffer(uint32_t buf_index);
+void printRMTBuffer(uint32_t buf_index);
