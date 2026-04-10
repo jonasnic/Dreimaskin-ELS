@@ -54,11 +54,18 @@ void uiTask(void *pv)
         
         if (stringComplete)
         {   
+
             stringComplete = false;
             incomingString[sizeof(incomingString) - 1] = '\0'; // Ensure null-termination
             Serial.print("Received command: ");
             Serial.println(incomingString);
 
+
+            //restart esp32 if command is "restart"
+            if (strcmp(incomingString, "restart") == 0) {
+                Serial.println("Restarting ESP32...");
+                esp_restart();
+            }
             MotionMode mode;
             if (parseModeCommand(incomingString, &mode)) {
                 cmd = {};
@@ -97,18 +104,18 @@ void uiTask(void *pv)
                 Serial.println(motionData.value.speed);
                 lastSpeed = motionData.value.speed;
             }
-            else if(motionData.type == DIRECTION) {
-                Serial.print("Current_Direction:");
-                Serial.println(motionData.value.direction ? "Positive" : "Negative");
-            }
-            else if(motionData.type == DISTANCE_TO_TARGET) {
-                Serial.print("Distance_to_Target:");
-                Serial.println(motionData.value.distance_to_target);
-            }
+            // // else if(motionData.type == DIRECTION) {
+            // //     Serial.print("Current_Direction:");
+            // //     Serial.println(motionData.value.direction ? "Positive" : "Negative");
+            // // }
+            // else if(motionData.type == DISTANCE_TO_TARGET) {
+            //     Serial.print("Distance_to_Target:");
+            //     Serial.println(motionData.value.distance_to_target);
+            // }
 
 
             // Publish to MQTT if connected (data cycles through position and speed)
-
+            
         }
         vTaskDelay(5);
     }
