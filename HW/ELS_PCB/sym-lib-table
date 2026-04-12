@@ -1,0 +1,5 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "doit-esp32-devkit-v1")(type "KiCad")(uri "${KIPRJMOD}/PARTS/doit-esp32-devkit-kicad/doit-esp32-devkit-v1.kicad_sym")(options "")(descr ""))
+  (lib (name "doit-esp32-devkit-vadsadsa")(type "Legacy")(uri "${KIPRJMOD}/PARTS/doit-esp32-devkit-kicad/doit-esp32-devkit-v1.lib")(options "")(descr ""))
+)
