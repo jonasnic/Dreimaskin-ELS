@@ -2,4 +2,5 @@
   (version 7)
   (lib (name "doit-esp32-devkit-v1")(type "KiCad")(uri "${KIPRJMOD}/PARTS/doit-esp32-devkit-kicad/doit-esp32-devkit-v1.kicad_sym")(options "")(descr ""))
   (lib (name "doit-esp32-devkit-vadsadsa")(type "Legacy")(uri "${KIPRJMOD}/PARTS/doit-esp32-devkit-kicad/doit-esp32-devkit-v1.lib")(options "")(descr ""))
+  (lib (name "LCSC")(type "KiCad")(uri "${KIPRJMOD}/PARTS/LCSC/LCSC.kicad_sym")(options "")(descr ""))
 )

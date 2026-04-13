@@ -1,47 +1,43 @@
 ############################################
-# PlatformIO / firmware build outputs
+# PlatformIO
 ############################################
-**/.pio/
-**/.piolibdeps/
-**/build/
-**/output/
+.pio/
+.piolibdeps/
+
+############################################
+# VS Code (local workspace settings/cache)
+############################################
+.vscode/
+
+############################################
+# Python
+############################################
+.venv/
+venv/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+
+############################################
+# Build outputs and firmware artifacts
+############################################
+build/
+output/
 *.elf
 *.bin
 *.hex
 *.map
 
 ############################################
-# VS Code local files
-############################################
-.vscode/
-**/.vscode/
-
-############################################
-# Python environments/cache
-############################################
-**/.venv/
-**/venv/
-**/ENV/
-**/__pycache__/
-*.pyc
-*.pyo
-
-############################################
-# KiCad and editor backup/temp files
+# KiCad and editor backup files
 ############################################
 *.kicad_pcb.lck
-*.kicad_sch.lck
-~*.lck
-*_autosave-*.kicad_pcb
-*_autosave-*.kicad_sch
-fp-info-cache
 *.kicad_sch-bak
 *.kicad_pcb-bak
 *.bak
 *.bck
 *~
-HW/*-backups.zip
-HW/ELS_PCB/ELS_project-backups/
 
 ############################################
 # Nextion artifacts
@@ -50,9 +46,9 @@ NEXT/*.tft
 NEXT/output/
 
 ############################################
-# Secrets
+# Secrets (IMPORTANT)
 ############################################
-SW/ESP_ELS/include/secrets.h
+include/secrets.h
 *.env
 .env
 .env.*
