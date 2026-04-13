@@ -92,66 +92,6 @@ static inline uint32_t steps_to_stop(int32_t speed) {
     return (uint64_t)v * v / (2 * ACCELERATION);
 }
 
-static bool plan_motion_batch(int32_t planPosition, int32_t planSpeed, MotionBatch *batch) {
-    if (batch == NULL) return false;
-
-    int32_t dist = target_position_stepp - planPosition;
-    uint32_t remaining = abs(dist);
-    bool dir = (dist > 0);
-
-    if (remaining == 0) {
-        batch->valid = false;
-        return false;
-    }
-
-    // prevent instant reversal at speed
-    if ((planSpeed > 0 && !dir) || (planSpeed < 0 && dir)) {
-        uint32_t block = steps_to_stop(planSpeed);
-        if (block == 0)
-            block = 1;
-        if (block > MAX_RMT_STEPS)
-            block = MAX_RMT_STEPS;
-
-        bool currentDir = planSpeed >= 0;
-        return build_motion_batch(block, -ACCELERATION, currentDir, planSpeed, batch);
-    }
-
-    uint32_t stop_steps = steps_to_stop(planSpeed);
-
-    uint32_t block = remaining;
-    if (block > MAX_RMT_STEPS)
-        block = MAX_RMT_STEPS;
-
-    if (stop_steps >= remaining)
-        return build_motion_batch(block, DECELERATION, dir, planSpeed, batch);
-    if (abs(planSpeed) < MAX_SPEED)
-        return build_motion_batch(block, ACCELERATION, dir, planSpeed, batch);
-    return build_motion_batch(block, 0, dir, planSpeed, batch);
-}
-
-static void queue_next_motion_batch() {
-    MotionBatch batch = {};
-    if (!plan_motion_batch(current_position_stepp, current_stepper_speed_Hz, &batch)) {
-        running = false;
-        current_stepper_speed_Hz = 0;
-        return;
-    }
-
-    submit_motion_batch(batch);
-}
-
-static void prepare_pending_batch() {
-    if (!uses_preplanned_batches() || !running || motionBlockDone || pendingBatch.valid) {
-        return;
-    }
-
-    MotionBatch batch = {};
-    if (!plan_motion_batch(current_position_stepp, current_stepper_speed_Hz, &batch)) {
-        return;
-    }
-
-    pendingBatch = batch;
-}
 
 /*
 This callback is called by the RMT driver when it finishes transmitting the pulse sequence.
@@ -175,17 +115,32 @@ void IRAM_ATTR onRMTTransmissionComplete(rmt_callback_arg_t *arg) {
 // calcualte the speed of the target we are tracking (enocder on spindel)
 void update_target_speed() {
     static uint64_t lastMicros = micros();
+    static float filteredSpeed = 0.0f;
     uint64_t currentMicros = micros();
     uint64_t deltaMicros = currentMicros - lastMicros;
+
+    // Skip very short intervals to reduce quantization/timer jitter in speed estimate.
+    if (deltaMicros < 500) {
+        return;
+    }
+
     lastMicros = currentMicros;
 
     static int32_t lastTargetPos = 0;
     int32_t deltaPos = target_position_stepp - lastTargetPos;
     lastTargetPos = target_position_stepp;
 
-    int32_t newTargetSpeed = (deltaPos * 1000000) / (int64_t)deltaMicros; // steps per second
+    float instantSpeed = ((float)deltaPos * 1000000.0f) / (float)deltaMicros; // steps per second
 
-    target_speed_Hz = newTargetSpeed;
+    // Exponential moving average to smooth jumpy speed readings.
+    static constexpr float kSpeedFilterAlpha = 0.2f;
+    filteredSpeed += kSpeedFilterAlpha * (instantSpeed - filteredSpeed);
+
+    if (fabsf(filteredSpeed) < 0.5f) {
+        filteredSpeed = 0.0f;
+    }
+
+    target_speed_Hz = (int32_t)lroundf(filteredSpeed);
 }
 
 // MARK: MAIN
@@ -215,7 +170,8 @@ void motionTask(void *pv) {
 
         encoderTotal += readEncoder_steps_sinse_last();
 
-        target_position_stepp = (int32_t)lroundf(((float)encoderTotal / (float)SPINDEL_ENCODER_COUNT_PER_REV) * mm_per_rev_pitch * (float)STEPS_PER_MM); // convert encoder counts to linear position in steps
+        //calculate the target position in steps from the encoder counts, to know where we are in relation to the target and decide if we need to move towards it or if we can stop
+        target_position_stepp = (int32_t)lroundf(((int64_t)encoderTotal * STEPS_PER_MM * mm_per_rev_pitch) / SPINDEL_ENCODER_COUNT_PER_REV); // convert encoder counts to linear position in steps
 
         /*  if RMT has completed the previous motion batch and started on  the next one,
             we check if we need to queue the next batch to continue moving towards the target
@@ -227,11 +183,10 @@ void motionTask(void *pv) {
             motionBlockDone = false;
             update_target_speed();
             // update_target_position_from_encoder(); // update current_position_stepp with the actual position from the encoder, to correct any drift from missed steps or external forces
-            // update_target_speed();
 
             int32_t error = target_position_stepp - current_position_stepp;
 
-            if (error > 0)
+            if (error > 0) //99% sure this will be okay because of the way we calculate the error and update the current_position_stepp
                 dir = false;
             else if (error < 0)
                 dir = true;
@@ -239,7 +194,7 @@ void motionTask(void *pv) {
             uint32_t stepsToLoad = constrain(abs(error), 0, 64);
 
             static uint8_t kp_error = 5;
-            uint32_t speed = (uint32_t)(target_speed_Hz + error * kp_error); // simple P controller on the error to try to correct it, we can tune the kP gain (0.05 here) to get better performance, or even add integral and derivative terms for a full PID controller if needed
+            uint32_t speed = (uint32_t)(abs(target_speed_Hz) + abs(error) * kp_error); // simple P controller on the error to try to correct it, we can tune the kP gain (0.05 here) to get better performance, or even add integral and derivative terms for a full PID controller if needed
 
             speed = constrain(speed, MIN_SPEED, MAX_SPEED);
             static int32_t lastSpeed = speed;
@@ -260,7 +215,7 @@ void motionTask(void *pv) {
             else
             current_position_stepp += stepsToLoad;
 
-            Serial.printf("Target: %d, Current: %d, Error: %d, Speed: %d, Steps loaded: %d\n", target_position_stepp, current_position_stepp, error, speed, stepsToLoad);
+            Serial.printf("Error:%3ld TargetSpeed:%5ld Speed:%5lu Steps:%3lu\n", (long)error, (long)target_speed_Hz, (unsigned long)speed, (unsigned long)stepsToLoad);
             // SOME TEST CODE
             //  static uint32_t frequencyHz = 600;
             //  loadNextBufferHz(64, frequencyHz);//TEST
