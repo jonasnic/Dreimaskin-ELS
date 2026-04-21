@@ -9,7 +9,7 @@
 constexpr uint32_t RMT_TICKS_1US = (80 / RMT_CLK_DIV);
 constexpr uint32_t RMT_TICK_1MS = RMT_TICKS_1US * 1000;
 constexpr uint32_t RMT_TICK_1S = RMT_TICK_1MS * 1000;
-constexpr uint32_t RMT_HIGH_PULSE_TICKS = RMT_TICKS_1US * 4;
+constexpr uint32_t RMT_HIGH_PULSE_TICKS = RMT_TICKS_1US * 2;
 constexpr uint32_t NOPULS_LENGTH_TICKS = 2; // duration of the "no pulse" item in ticks, should be short to minimize delay when we read from a buffer before filling it, but must be > 2 and devisable by 2
 
 // load the uint32_t with the bit pattern for the RMT item with the given parameters

@@ -64,7 +64,7 @@ static bool build_motion_batch(uint32_t steps, int32_t accel_sign, bool dir, int
     }
 
     if (speed_end < 0.0f) speed_end = 0.0f;
-    if (speed_end > MAX_SPEED) speed_end = MAX_SPEED;
+    if (speed_end > MAX_SPEEDHZ) speed_end = MAX_SPEEDHZ;
 
     batch->steps = (uint16_t)steps;
     batch->frequencyHz = (uint32_t)speed_start;
@@ -91,7 +91,6 @@ static inline uint32_t steps_to_stop(int32_t speed) {
     uint32_t v = abs(speed);
     return (uint64_t)v * v / (2 * ACCELERATION);
 }
-
 
 /*
 This callback is called by the RMT driver when it finishes transmitting the pulse sequence.
@@ -159,7 +158,7 @@ void motionTask(void *pv) {
     // delay(10000); // Short delay to ensure RMT is set up before we start sending pulses
     startRMT();
 
-    setupStepCounter((gpio_num_t)PULSE_WATCH_PIN, (gpio_num_t)DIR_WATCH_PIN);
+    // setupStepCounter((gpio_num_t)PULSE_WATCH_PIN, (gpio_num_t)DIR_WATCH_PIN);
 
     //-----------------------------------------------
     bool lastRunning = false;
@@ -169,10 +168,10 @@ void motionTask(void *pv) {
         targetChanged = checkForUIUdates();
 
         encoderTotal += readEncoder_steps_sinse_last();
-
-        //calculate the target position in steps from the encoder counts, to know where we are in relation to the target and decide if we need to move towards it or if we can stop
+        // Serial.printf("Encoder total: %ld\n", (long)encoderTotal);
+        // calculate the target position in steps from the encoder counts, to know where we are in relation to the target and decide if we need to move towards it or if we can stop
         target_position_stepp = (int32_t)lroundf(((int64_t)encoderTotal * STEPS_PER_MM * mm_per_rev_pitch) / SPINDEL_ENCODER_COUNT_PER_REV); // convert encoder counts to linear position in steps
-
+// Serial.printf("Target position (steps): %ld\n", (long)target_position_stepp);
         /*  if RMT has completed the previous motion batch and started on  the next one,
             we check if we need to queue the next batch to continue moving towards the target
             or if we can stop because we've reached the target
@@ -185,49 +184,66 @@ void motionTask(void *pv) {
             // update_target_position_from_encoder(); // update current_position_stepp with the actual position from the encoder, to correct any drift from missed steps or external forces
 
             int32_t error = target_position_stepp - current_position_stepp;
-
-            if (error > 0) //99% sure this will be okay because of the way we calculate the error and update the current_position_stepp
+            // Serial.printf("Error:%3ld TargetSpeed:%5ld CurrentSpeed:%5ld\n", (long)error, (long)target_speed_Hz, (long)current_stepper_speed_Hz);
+            if (error > 0) // 99% sure this will be okay because of the way we calculate the error and update the current_position_stepp
                 dir = false;
             else if (error < 0)
                 dir = true;
             digitalWrite(DIR_PIN, dir);
-            uint32_t stepsToLoad = constrain(abs(error), 0, 64);
 
-            static uint8_t kp_error = 5;
-            uint32_t speed = (uint32_t)(abs(target_speed_Hz) + abs(error) * kp_error); // simple P controller on the error to try to correct it, we can tune the kP gain (0.05 here) to get better performance, or even add integral and derivative terms for a full PID controller if needed
+            // Backlash compensation: when direction reverses, shift current_position_stepp
+            // away from target by BACKLASH_STEPS so the controller drives those extra pulses
+            // through the leadscrew slack before advancing the carriage.
+            static bool lastDir = false;
+            // if (BACKLASH_STEPS > 0 && dir != lastDir) {
+                if (dir) // switching to negative direction
+                {
+                    current_position_stepp += BACKLASH_STEPS;
+                    error = target_position_stepp - current_position_stepp; // recalculate error after backlash compensation
+                } else                                                      // switching to positive direction
+                {
+                    current_position_stepp -= BACKLASH_STEPS;
+                    error = target_position_stepp - current_position_stepp; // recalculate error after backlash compensation
+                }
+                lastDir = dir;
+                uint32_t stepsToLoad = constrain(abs(error), 0, 64);
 
-            speed = constrain(speed, MIN_SPEED, MAX_SPEED);
-            static int32_t lastSpeed = speed;
-            if (lastSpeed < speed) {
-                speed = min(speed, lastSpeed + (uint32_t)ACCELERATION);
-            } else if (lastSpeed > speed) {
-                speed = max(speed, lastSpeed + (uint32_t)DECELERATION);
-            }
-            lastSpeed = speed;
+                static uint8_t kp_error = 5;
+                uint32_t speed = (uint32_t)(abs(target_speed_Hz) + abs(error) * kp_error); // simple P controller on the error to try to correct it, we can tune the kP gain (0.05 here) to get better performance, or even add integral and derivative terms for a full PID controller if needed
 
-            const uint32_t target_batch_time_us = 2000;
-            uint32_t st = target_batch_time_us / Hz2Us(speed);
-            stepsToLoad = min(stepsToLoad, st);
+                static int32_t lastSpeed = speed;
+                if (lastSpeed < speed) {
+                    speed = min(speed, lastSpeed + (uint32_t)ACCELERATION);
+                } else if (lastSpeed > speed) {
+                    speed = max(speed, lastSpeed + (uint32_t)DECELERATION);
+                }
+                speed = constrain(speed, MIN_SPEED, MAX_SPEEDHZ);
+                lastSpeed = speed;
 
-            loadNextBufferHz(stepsToLoad, speed); // this will trigger the onRMTTransmissionComplete callback when done, which will set motionBlockDone to true and allow us to load the next batch if needed
-            if (dir)
-                current_position_stepp -= stepsToLoad;
-            else
-            current_position_stepp += stepsToLoad;
+                const uint32_t target_batch_time_us = 2000;
+                uint32_t st = target_batch_time_us / Hz2Us(speed);
+                stepsToLoad = min(stepsToLoad, st);
 
-            Serial.printf("Error:%3ld TargetSpeed:%5ld Speed:%5lu Steps:%3lu\n", (long)error, (long)target_speed_Hz, (unsigned long)speed, (unsigned long)stepsToLoad);
-            // SOME TEST CODE
-            //  static uint32_t frequencyHz = 600;
-            //  loadNextBufferHz(64, frequencyHz);//TEST
-            //  frequencyHz += 400;
-            //  if (frequencyHz > MAX_SPEED) frequencyHz = MAX_SPEED;
+                loadNextBufferHz(stepsToLoad, speed); // this will trigger the onRMTTransmissionComplete callback when done, which will set motionBlockDone to true and allow us to load the next batch if needed
+                if (dir)
+                    current_position_stepp -= stepsToLoad;
+                else
+                    current_position_stepp += stepsToLoad;
+
+                // Serial.printf("Error:%3ld TargetSpeed:%5ld Speed:%5lu Steps:%3lu\n", (long)error, (long)target_speed_Hz, (unsigned long)speed, (unsigned long)stepsToLoad);
+                // SOME TEST CODE
+                //  static uint32_t frequencyHz = 600;
+                //  loadNextBufferHz(64, frequencyHz);//TEST
+                //  frequencyHz += 400;
+                //  if (frequencyHz > MAX_SPEED) frequencyHz = MAX_SPEED;
+            // }
+
+            // prepare_pending_batch();
+            report_data();
+
+            // Sleep until TX complete notification or timeout; notify path minimizes inter-block gap.
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
         }
-
-        // prepare_pending_batch();
-        report_data();
-
-        // Sleep until TX complete notification or timeout; notify path minimizes inter-block gap.
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
     }
 }
 
@@ -239,7 +255,7 @@ bool checkForUIUdates() {
         if (cmd.cmd == MOTION_CMD_SET_MODE) {
             motionMode = (cmd.mode == MOTION_MODE_FOLLOW) ? MOTION_MODE_FOLLOW : MOTION_MODE_POSITION;
             pendingBatch.valid = false;
-            Serial.printf("Motion mode: %s\n", motionMode == MOTION_MODE_FOLLOW ? "follow" : "position");
+            // Serial.printf("Motion mode: %s\n", motionMode == MOTION_MODE_FOLLOW ? "follow" : "position");
         } else {
             target_position_stepp = cmd.target;
             updated = true;
