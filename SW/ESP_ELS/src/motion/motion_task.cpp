@@ -3,7 +3,7 @@
 #include "encoder.h"
 #include "freertos/task.h"
 #include "rmt.h"
-#include "step_counter.h"
+
 #include "utils.h"
 
 const int DBG_PIN = 23; // for debug timing of ISR and motion task loop
@@ -12,7 +12,6 @@ int32_t target_position_stepp = 0; // meassured in steps, can be positive or neg
 int32_t target_speed_Hz = 0;       // signed steps/sec
 
 int32_t volatile current_position_stepp = 0; // meassured in steps, can be positive or negative depending on direction
-// volatile bool running = false;               // Flag to indicate if the motion task is currently executing a move. will use to know if ISR are in effect or not
 static int32_t current_stepper_speed_Hz = 0; // signed steps/sec
 static volatile bool motionBlockDone = true;
 static TaskHandle_t motionTaskHandle = NULL;
@@ -202,11 +201,11 @@ void motionTask(void *pv) {
         uint64_t loopTime = currentMicros - lastMicros;
         lastMicros = currentMicros;
         // Serial.printf("\nLoop time: %u. steps: %d, ", (unsigned int)loopTime, batches[batchIndex].steps); // this is for debug. will remove later
-        digitalWrite(DBG_PIN, dbg_value); // Toggle debug pin to measure loop time with oscilloscope
-        dbg_value = !dbg_value;
+        digitalWrite(DBG_PIN, LOW); // Toggle debug pin to measure loop time with oscilloscope
+        // dbg_value = !dbg_value;
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // wait for rmt to finish
-       digitalWrite(DBG_PIN, dbg_value); // Toggle debug pin to measure loop time with oscilloscope
-        dbg_value = !dbg_value;
+       digitalWrite(DBG_PIN, HIGH); // Toggle debug pin to measure loop time with oscilloscope
+        // dbg_value = !dbg_value;
         
         uint32_t steps = stepsJustDone;
         stepsJustDone = 0;
@@ -224,7 +223,6 @@ void motionTask(void *pv) {
         stepper_direction error_dir = error >= 0 ? DIRECTION_CW : DIRECTION_CCW;
         if (!update_direction_if_needed(error)) {
             continue;// we need to change dir but are moving. wait until stepper have stopped to change direction
-
         }
 
         uint32_t steps_to_take = constrain(abs(error), 0, MAX_RMT_STEPS);

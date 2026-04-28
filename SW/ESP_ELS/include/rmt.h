@@ -1,5 +1,6 @@
 #pragma once
 #include "driver/rmt.h"
+#include "config.h"
 
 #define RMT_CH RMT_CHANNEL_0
 constexpr uint32_t RMT_STEPS_PER_BUFFER = 64;
@@ -14,9 +15,9 @@ const uint32_t TIME_PR_TICK_NS = 1000000000/(80000000 / RMT_CLK_DIV ); // time i
 
 //going for 500Hz update rate, so 2ms buffer duration, with 2µs high pulse time
 // 2ms/64 givs 31250ns per step at maximum steps per buffer, which is 32kHz.
-const uint32_t UPDATE_RATE_HZ_intern = 500; // should be the same as UPDATE_RATE_HZ in motion_task.h, but we define it here as well to be able to use it in the calculation of the pulse timing constants without including motion_task.h here and creating a circular dependency
 
-const uint64_t PERIODE_TIME_NS = 1000000000/UPDATE_RATE_HZ_intern;
+
+const uint64_t PERIODE_TIME_NS = 1000000000/UPDATE_RATE_HZ;
 const uint32_t PERIODE_PER_STEP_NS = PERIODE_TIME_NS / RMT_STEPS_PER_BUFFER; // time in nanoseconds that each step should take to achieve the target update rate at maximum steps per buffer
 
 const uint32_t PULSE_HIGH_TIME_NS = 2 * 1000; // 2µs high pulse time
