@@ -16,7 +16,7 @@ constexpr bool kWiFiOnlyDiagnosticMode = false;
 #endif
 
 void setup() {
-    Serial.begin(500000);
+    Serial.begin(1000000);
     pinMode(LED_BUILTIN, OUTPUT);
     Serial.println("[BOOT] setup start");
     Serial.printf("[BOOT] Free heap at boot: %u\n", (unsigned)ESP.getFreeHeap());

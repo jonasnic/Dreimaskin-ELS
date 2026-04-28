@@ -2,54 +2,57 @@
 
 #include <Arduino.h>
 
-pcnt_unit_t SPINDEL_ENCODER_PCNT_UNIT = PCNT_UNIT_0;
-int64_t encoder_count = 0; // this will hold the total count of the encoder, we will update it with the deltas we read from the pcnt in readEncoder_steps_sinse_last() to keep track of the actual position in steps, since the pcnt counter is only 16 bit and will overflow/underflow quickly
+pcnt_unit_t SPINDLE_ENCODER_PCNT_UNIT = PCNT_UNIT_0;
+int64_t encoder_count = 0; // this will hold the total count of the encoder, we will update it with the deltas we read from the pcnt in read_encoder_steps_since_last() to keep track of the actual position in steps, since the pcnt counter is only 16 bit and will overflow/underflow quickly
+int16_t delta; // last delta value;
+uint64_t delta_time; // time of the last delta update, used to calculate speed if needed
 constexpr int16_t PCNT_LIMIT = 32000;
 constexpr int16_t DELTA_THRESHOLD = 20000; // threshold to detect overflow/underflow, should be less than half of the PCNT_LIMIT
 
 void setupEncoder() {
-    pinMode(SPINDEL_ENCODER_CHANNEL_A_PIN, INPUT_PULLUP);
-    pinMode(SPINDEL_ENCODER_CHANNEL_B_PIN, INPUT_PULLUP);
-    pinMode(SPINDEL_ENCODER_CHANNEL_Z_PIN, INPUT_PULLUP);
+    pinMode(SPINDLE_ENCODER_CHANNEL_A_PIN, INPUT_PULLUP);
+    pinMode(SPINDLE_ENCODER_CHANNEL_B_PIN, INPUT_PULLUP);
+    pinMode(SPINDLE_ENCODER_CHANNEL_Z_PIN, INPUT_PULLUP);
 
     pcnt_config_t pcntA{
-        .pulse_gpio_num = SPINDEL_ENCODER_CHANNEL_A_PIN,
-        .ctrl_gpio_num = SPINDEL_ENCODER_CHANNEL_B_PIN,
+        .pulse_gpio_num = SPINDLE_ENCODER_CHANNEL_A_PIN,
+        .ctrl_gpio_num = SPINDLE_ENCODER_CHANNEL_B_PIN,
         .lctrl_mode = PCNT_MODE_REVERSE,
         .hctrl_mode = PCNT_MODE_KEEP,
         .pos_mode = PCNT_COUNT_INC,
         .neg_mode = PCNT_COUNT_DEC,
         .counter_h_lim = PCNT_LIMIT,
         .counter_l_lim = -PCNT_LIMIT,
-        .unit = SPINDEL_ENCODER_PCNT_UNIT,
+        .unit = SPINDLE_ENCODER_PCNT_UNIT,
         .channel = PCNT_CHANNEL_0,
     };
 
     pcnt_config_t pcntB{
-        .pulse_gpio_num = SPINDEL_ENCODER_CHANNEL_B_PIN,
-        .ctrl_gpio_num = SPINDEL_ENCODER_CHANNEL_A_PIN,
+        .pulse_gpio_num = SPINDLE_ENCODER_CHANNEL_B_PIN,
+        .ctrl_gpio_num = SPINDLE_ENCODER_CHANNEL_A_PIN,
         .lctrl_mode = PCNT_MODE_REVERSE,
         .hctrl_mode = PCNT_MODE_KEEP,
         .pos_mode = PCNT_COUNT_DEC,
         .neg_mode = PCNT_COUNT_INC,
         .counter_h_lim = PCNT_LIMIT,
         .counter_l_lim = -PCNT_LIMIT,
-        .unit = SPINDEL_ENCODER_PCNT_UNIT,
+        .unit = SPINDLE_ENCODER_PCNT_UNIT,
         .channel = PCNT_CHANNEL_1};
 
     pcnt_unit_config(&pcntA);
     pcnt_unit_config(&pcntB);
 
-    pcnt_counter_pause(SPINDEL_ENCODER_PCNT_UNIT);
-    pcnt_counter_clear(SPINDEL_ENCODER_PCNT_UNIT);
-    pcnt_counter_resume(SPINDEL_ENCODER_PCNT_UNIT);
+    pcnt_counter_pause(SPINDLE_ENCODER_PCNT_UNIT);
+    pcnt_counter_clear(SPINDLE_ENCODER_PCNT_UNIT);
+    pcnt_counter_resume(SPINDLE_ENCODER_PCNT_UNIT);
 }
 
-int16_t readEncoder_steps_sinse_last() {
+void encoder_update(){
     int16_t current_count;
-    pcnt_get_counter_value(SPINDEL_ENCODER_PCNT_UNIT, &current_count);
+    pcnt_get_counter_value(SPINDLE_ENCODER_PCNT_UNIT, &current_count);
     static int16_t last_count = 0;
-    int16_t delta = current_count - last_count;
+    delta = current_count - last_count;
+    last_count = current_count;
     if (delta > DELTA_THRESHOLD) {
         // Handle overflow
         delta -= PCNT_LIMIT;
@@ -57,23 +60,36 @@ int16_t readEncoder_steps_sinse_last() {
         // Handle underflow
         delta += PCNT_LIMIT;
     }
+    static uint64_t last_update_time = 0;
+    uint64_t now = micros();
+    delta_time = now - last_update_time;
+    last_update_time = now;
     encoder_count += delta;
-    last_count = current_count;
+    
+}
 
+int16_t read_encoder_steps_since_last() {
     return delta;
-    // return current_count;
 }
 int64_t getEncoderPosition() {
     return encoder_count;
 }
+float getEncoderRPS() {
+    if (delta_time == 0) return 0;
+    float rps = ((float)(delta*1000000) / SPINDLE_ENCODER_COUNT_PER_REV ) / delta_time;
+    return rps;
+}
+int32_t getEncoderRPM() {
+    return (int32_t)(getEncoderRPS() * 60.0f);
+}
 
 float get_encoder_degrees() {
-    return fmodf(((float)encoder_count / SPINDEL_ENCODER_COUNT_PER_REV) * 360.0f, 360.0f); // Calculate the angle in degrees based on the encoder count and counts per revolution, and wrap it to 0-360 degrees
+    return fmodf(((float)encoder_count / SPINDLE_ENCODER_COUNT_PER_REV) * 360.0f, 360.0f); // Calculate the angle in degrees based on the encoder count and counts per revolution, and wrap it to 0-360 degrees
 }
 
 void resetEncoder() {
     encoder_count = 0;
-    pcnt_counter_pause(SPINDEL_ENCODER_PCNT_UNIT);
-    pcnt_counter_clear(SPINDEL_ENCODER_PCNT_UNIT);
-    pcnt_counter_resume(SPINDEL_ENCODER_PCNT_UNIT);
+    pcnt_counter_pause(SPINDLE_ENCODER_PCNT_UNIT);
+    pcnt_counter_clear(SPINDLE_ENCODER_PCNT_UNIT);
+    pcnt_counter_resume(SPINDLE_ENCODER_PCNT_UNIT);
 }

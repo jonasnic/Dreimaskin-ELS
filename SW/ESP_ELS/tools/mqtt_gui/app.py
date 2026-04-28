@@ -1,4 +1,5 @@
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -21,6 +22,8 @@ class MqttGuiApp:
         self.client = None
         self.connected = False
         self.connecting = False
+        self.status_rows = {}
+        self.last_speed_steps_per_s = None
 
         # Data history for plotting (keep last 300 samples)
         self.max_history = 300
@@ -80,6 +83,33 @@ class MqttGuiApp:
         self.send_mode_btn = ttk.Button(control_frame, text="Send Mode", command=self.send_mode, state=tk.DISABLED)
         self.send_mode_btn.grid(row=0, column=5)
 
+        self.steps_per_rev_var = tk.StringVar(value="1000")
+        self.steps_per_rev_var.trace_add("write", self._on_steps_per_rev_changed)
+        ttk.Label(control_frame, text="Steps/Rev").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Entry(control_frame, textvariable=self.steps_per_rev_var, width=12).grid(row=1, column=1, padx=6, pady=(8, 0))
+
+        self.mm_per_rev_var = tk.StringVar(value="1.00000")
+        ttk.Label(control_frame, text="mm/rev").grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Entry(control_frame, textvariable=self.mm_per_rev_var, width=12).grid(row=2, column=1, padx=6, pady=(8, 0))
+        self.send_pitch_btn = ttk.Button(control_frame, text="Send Pitch", command=self.send_pitch, state=tk.DISABLED)
+        self.send_pitch_btn.grid(row=2, column=2, pady=(8, 0))
+
+        self.stepper_enable_btn = ttk.Button(
+            control_frame,
+            text="Enable Stepper",
+            command=lambda: self.send_stepper_enable(True),
+            state=tk.DISABLED,
+        )
+        self.stepper_enable_btn.grid(row=1, column=2, pady=(8, 0))
+
+        self.stepper_disable_btn = ttk.Button(
+            control_frame,
+            text="Disable Stepper",
+            command=lambda: self.send_stepper_enable(False),
+            state=tk.DISABLED,
+        )
+        self.stepper_disable_btn.grid(row=1, column=3, pady=(8, 0))
+
         status_frame = ttk.LabelFrame(main, text="Live Status", padding=10)
         status_frame.pack(fill=tk.X, pady=(10, 0))
 
@@ -88,6 +118,12 @@ class MqttGuiApp:
         self.target_status_var = tk.StringVar(value="-")
         self.distance_to_target_var = tk.StringVar(value="-")
         self.mode_status_var = tk.StringVar(value="-")
+        self.rpm_var = tk.StringVar(value="-")
+        self.alarm_var = tk.StringVar(value="-")
+        self.stepper_status_var = tk.StringVar(value="Unknown")
+        self.loop_time_var = tk.StringVar(value="-")
+        self.batch_time_var = tk.StringVar(value="-")
+        self.last_update_var = tk.StringVar(value="-")
         self.alive_var = tk.StringVar(value="-")
         self.conn_state_var = tk.StringVar(value="Disconnected")
 
@@ -103,7 +139,23 @@ class MqttGuiApp:
         self._status_row(status_frame, 1, "Connection", self.conn_state_var)
         self._status_row(status_frame, 2, "Speed", self.speed_var)
         self._status_row(status_frame, 3, "Mode", self.mode_status_var)
-        self._status_row(status_frame, 4, "Alive", self.alive_var)
+        self._status_row(status_frame, 4, "RPM", self.rpm_var)
+        self._status_row(status_frame, 5, "Alarm", self.alarm_var)
+        self._status_row(status_frame, 6, "Stepper", self.stepper_status_var)
+        self._status_row(status_frame, 7, "Loop Time (us)", self.loop_time_var)
+        self._status_row(status_frame, 8, "Batch Time (us)", self.batch_time_var)
+        self._status_row(status_frame, 9, "Alive", self.alive_var)
+        self._status_row(status_frame, 10, "Last Update", self.last_update_var)
+
+        all_status_frame = ttk.LabelFrame(main, text="All MQTT Status Topics", padding=10)
+        all_status_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+        self.status_tree = ttk.Treeview(all_status_frame, columns=("topic", "value"), show="headings", height=8)
+        self.status_tree.heading("topic", text="Topic Suffix")
+        self.status_tree.heading("value", text="Value")
+        self.status_tree.column("topic", width=260, anchor=tk.W)
+        self.status_tree.column("value", width=260, anchor=tk.W)
+        self.status_tree.pack(fill=tk.BOTH, expand=True)
 
         # Create plot frames
         plots_frame = ttk.LabelFrame(main, text="Graphs", padding=10)
@@ -189,12 +241,18 @@ class MqttGuiApp:
         return {
             "cmd_target": f"{base}/command",
             "cmd_mode": f"{base}/command/mode",
+            "cmd_pitch": f"{base}/command/pitch",
+            "cmd_stepper": f"{base}/command",
             "status_pos": f"{base}/status/position",
             "status_speed": f"{base}/status/speed",
             "status_target": f"{base}/status/target",
             "status_distance": f"{base}/status/distance_to_target",
             "status_mode": f"{base}/status/mode",
+            "status_alarm": f"{base}/status/alarm",
+            "status_loop_time": f"{base}/status/loop_time_us",
+            "status_batch_time": f"{base}/status/batch_time_us",
             "status_alive": f"{base}/status",
+            "status_all": f"{base}/status/#",
         }
 
     def connect(self):
@@ -273,6 +331,76 @@ class MqttGuiApp:
         else:
             self.log("Failed to publish mode")
 
+    def send_stepper_enable(self, enable):
+        if not self.connected or not self.client:
+            return
+
+        payload = "enable stepper" if enable else "disable stepper"
+        t = self.topics()
+        ok = self.client.publish(t["cmd_stepper"], payload, qos=0, retain=False)
+        if ok.rc == mqtt.MQTT_ERR_SUCCESS:
+            self.stepper_status_var.set("Enabled" if enable else "Disabled")
+            self.log(f"Published stepper command: {payload}")
+        else:
+            self.log("Failed to publish stepper command")
+
+    def send_pitch(self):
+        if not self.connected or not self.client:
+            return
+
+        pitch_text = self.mm_per_rev_var.get().strip()
+        pitch_value = self._extract_number(pitch_text)
+        if pitch_value is None or pitch_value <= 0:
+            messagebox.showerror("Invalid Pitch", "mm/rev must be a positive number")
+            return
+
+        # Keep a stable precision so firmware parsers can safely scale to 1e5 if needed.
+        payload = f"{pitch_value:.5f}"
+        t = self.topics()
+        ok = self.client.publish(t["cmd_pitch"], payload, qos=0, retain=False)
+        if ok.rc == mqtt.MQTT_ERR_SUCCESS:
+            self.mm_per_rev_var.set(payload)
+            self.log(f"Published pitch (mm/rev): {payload}")
+        else:
+            self.log("Failed to publish pitch command")
+
+    def _update_status_tree(self, suffix, payload):
+        item_id = self.status_rows.get(suffix)
+        if item_id is None:
+            self.status_rows[suffix] = self.status_tree.insert("", tk.END, values=(suffix, payload))
+        else:
+            self.status_tree.item(item_id, values=(suffix, payload))
+
+    def _update_speed_derived(self, payload):
+        speed_steps_per_s = self._extract_number(payload)
+        if speed_steps_per_s is None:
+            self.rpm_var.set("-")
+            return
+
+        self.last_speed_steps_per_s = speed_steps_per_s
+
+        steps_per_rev = self._extract_number(self.steps_per_rev_var.get())
+        if steps_per_rev is None or steps_per_rev <= 0:
+            self.rpm_var.set("-")
+            return
+
+        rpm = (speed_steps_per_s * 60.0) / steps_per_rev
+        self.rpm_var.set(f"{rpm:.1f}")
+
+    def _extract_number(self, text):
+        try:
+            return float(str(text).strip())
+        except ValueError:
+            match = re.search(r"[-+]?\d*\.?\d+", str(text))
+            return float(match.group(0)) if match else None
+
+    def _on_steps_per_rev_changed(self, *_):
+        if self.last_speed_steps_per_s is not None:
+            self._update_speed_derived(str(self.last_speed_steps_per_s))
+
+    def _update_last_update_time(self):
+        self.last_update_var.set(time.strftime("%H:%M:%S"))
+
     def _on_connect(self, client, userdata, flags, rc):
         self.event_queue.put(("connected", rc))
 
@@ -306,17 +434,13 @@ class MqttGuiApp:
                     self.disconnect_btn.configure(state=tk.NORMAL)
                     self.send_target_btn.configure(state=tk.NORMAL)
                     self.send_mode_btn.configure(state=tk.NORMAL)
+                    self.send_pitch_btn.configure(state=tk.NORMAL)
+                    self.stepper_enable_btn.configure(state=tk.NORMAL)
+                    self.stepper_disable_btn.configure(state=tk.NORMAL)
                     self.log("Connected")
 
                     t = self.topics()
-                    for topic in (
-                        t["status_pos"],
-                        t["status_speed"],
-                        t["status_target"],
-                        t["status_distance"],
-                        t["status_mode"],
-                        t["status_alive"],
-                    ):
+                    for topic in (t["status_all"],):
                         self.client.subscribe(topic)
                         self.log(f"Subscribed: {topic}")
                 else:
@@ -331,44 +455,68 @@ class MqttGuiApp:
                 self.disconnect_btn.configure(state=tk.DISABLED)
                 self.send_target_btn.configure(state=tk.DISABLED)
                 self.send_mode_btn.configure(state=tk.DISABLED)
+                self.send_pitch_btn.configure(state=tk.DISABLED)
+                self.stepper_enable_btn.configure(state=tk.DISABLED)
+                self.stepper_disable_btn.configure(state=tk.DISABLED)
                 self.log("Disconnected")
             elif kind == "message":
                 topic = evt[1]
                 payload = evt[2]
                 t = self.topics()
                 plots_updated = False
+                self._update_last_update_time()
 
-                if topic == t["status_pos"]:
+                base_status = t["status_alive"]
+                if topic == base_status:
+                    suffix = "alive"
+                elif topic.startswith(base_status + "/"):
+                    suffix = topic[len(base_status) + 1 :]
+                else:
+                    suffix = topic
+
+                self._update_status_tree(suffix, payload)
+
+                if suffix == "position":
                     self.position_var.set(payload)
                     try:
                         self.position_history.append(float(payload))
                         plots_updated = True
                     except ValueError:
                         pass
-                elif topic == t["status_speed"]:
+                elif suffix == "speed":
                     self.speed_var.set(payload)
+                    self._update_speed_derived(payload)
+                    speed_value = self._extract_number(payload)
                     try:
-                        self.speed_history.append(float(payload))
+                        if speed_value is None:
+                            raise ValueError
+                        self.speed_history.append(float(speed_value))
                         plots_updated = True
                     except ValueError:
                         pass
-                elif topic == t["status_target"]:
+                elif suffix == "target":
                     self.target_status_var.set(payload)
                     try:
                         self.target_history.append(float(payload))
                         plots_updated = True
                     except ValueError:
                         pass
-                elif topic == t["status_distance"]:
+                elif suffix == "distance_to_target":
                     self.distance_to_target_var.set(payload)
                     try:
                         self.distance_history.append(float(payload))
                         plots_updated = True
                     except ValueError:
                         pass
-                elif topic == t["status_mode"]:
+                elif suffix == "mode":
                     self.mode_status_var.set(payload)
-                elif topic == t["status_alive"]:
+                elif suffix == "alarm":
+                    self.alarm_var.set(payload)
+                elif suffix == "loop_time_us":
+                    self.loop_time_var.set(payload)
+                elif suffix == "batch_time_us":
+                    self.batch_time_var.set(payload)
+                elif suffix == "alive":
                     self.alive_var.set(payload)
 
                 if plots_updated:

@@ -2,94 +2,71 @@
 #include "../common/queues.h"
 #include "encoder.h"
 #include "freertos/task.h"
-#include "rmt_setup.h"
+#include "rmt.h"
 #include "step_counter.h"
 #include "utils.h"
+
+const int DBG_PIN = 23; // for debug timing of ISR and motion task loop
 
 int32_t target_position_stepp = 0; // meassured in steps, can be positive or negative depending on direction
 int32_t target_speed_Hz = 0;       // signed steps/sec
 
-int32_t current_position_stepp = 0; // meassured in steps, can be positive or negative depending on direction
+int32_t volatile current_position_stepp = 0; // meassured in steps, can be positive or negative depending on direction
 // volatile bool running = false;               // Flag to indicate if the motion task is currently executing a move. will use to know if ISR are in effect or not
 static int32_t current_stepper_speed_Hz = 0; // signed steps/sec
 static volatile bool motionBlockDone = true;
 static TaskHandle_t motionTaskHandle = NULL;
 static MotionMode motionMode = MOTION_MODE_POSITION;
-bool running = false;
-static constexpr float kMaxSpeedDeltaPerBatch = 3000.0f;
 
-float mm_per_rev_pitch = 1; // used for setting the speed of the stepper
+float mm_per_rev_pitch = 1; // used for setting the speed of the stepper UPDATED FROM UI
+static bool pitchChanged = true;
+volatile int8_t batches_in_flight = 0; // used to track how many motion batches have been submitted but not yet completed. so we know if we can change direction or not, because we need to stop before changing direction
+#define RUNNING (batches_in_flight > 0 || !motionBlockDone)
+volatile bool standing_still = true; // this is set to false in the RMT ISR when a batch is completed but we still have more batches in flight, so we know if we can change direction or not, because we need to stop before changing direction
+stepper_direction current_direction = DIRECTION_CW;
+volatile uint32_t stepsJustDone;
 
 void report_data();
+void report_loop_time(uint32_t startTime, uint32_t endTime);
+void report_batch_time(uint32_t batchTimeUs);
+void report_alarm(bool triggered);
+bool handelAlarm();
 bool checkForUIUdates();
+int32_t get_steps_needed();
+int32_t calc_speed_to_order(int32_t error);
 
-struct MotionBatch {
-    uint16_t steps;
-    uint32_t frequencyHz;
-    bool dir;
-    int32_t endSpeed;
-    bool valid;
-};
-static MotionBatch pendingBatch = {};
+
+static void setStepperEnableLevel(StepperEnableLevel level) {
+    digitalWrite(ENABLE_PIN, level);
+}
+
+void enableStepper() {
+    setStepperEnableLevel(STEPPER_ENABLED);
+}
+
+void disableStepper() {
+    setStepperEnableLevel(STEPPER_DISABLED);
+}
+
+bool isStepperEnabled() {
+    return digitalRead(ENABLE_PIN) == STEPPER_ENABLED;
+}
 
 static bool uses_preplanned_batches() {
     return motionMode == MOTION_MODE_POSITION;
 }
 
 static bool speed_direction_is_positive() {
-    return current_stepper_speed_Hz >= 0;
+    return current_direction == DIRECTION_CW;
 }
 
-static void apply_position_delta(uint32_t steps, bool dir) {
-    if (dir)
-        current_position_stepp += steps;
-    else
-        current_position_stepp -= steps;
-}
 
-static bool build_motion_batch(uint32_t steps, int32_t accel_sign, bool dir, int32_t startSpeed, MotionBatch *batch) {
-    if (steps == 0 || batch == NULL) return false;
-    if (steps > MAX_RMT_STEPS) steps = MAX_RMT_STEPS;
 
-    float speed_start = fabsf((float)startSpeed);
-    if (speed_start < 1.0f) speed_start = 1.0f; // only for starting from 0
+static bool submit_motion_batch(uint32_t steps) {
 
-    float speed_end = speed_start;
-    if (accel_sign != 0) {
-        // Batch-level acceleration update (no per-step acceleration calculation).
-        float dv = ((float)accel_sign * (float)steps) / speed_start;
-        if (dv > kMaxSpeedDeltaPerBatch) dv = kMaxSpeedDeltaPerBatch;
-        if (dv < -kMaxSpeedDeltaPerBatch) dv = -kMaxSpeedDeltaPerBatch;
-        speed_end += dv;
-    }
+    loadNextBuffer(steps);
 
-    if (speed_end < 0.0f) speed_end = 0.0f;
-    if (speed_end > MAX_SPEEDHZ) speed_end = MAX_SPEEDHZ;
-
-    batch->steps = (uint16_t)steps;
-    batch->frequencyHz = (uint32_t)speed_start;
-    batch->dir = dir;
-    batch->endSpeed = dir ? (int32_t)speed_end : -(int32_t)speed_end;
-    batch->valid = true;
     return true;
-}
-
-static bool submit_motion_batch(const MotionBatch &batch) {
-    setDirection(batch.dir, current_stepper_speed_Hz);
-
-    loadNextBufferHz(batch.steps, batch.frequencyHz);
-
-    current_stepper_speed_Hz = batch.endSpeed;
-    apply_position_delta(batch.steps, batch.dir);
-    motionBlockDone = false;
-    running = true;
-    return true;
-}
-
-// stopping distance in steps
-static inline uint32_t steps_to_stop(int32_t speed) {
-    uint32_t v = abs(speed);
-    return (uint64_t)v * v / (2 * ACCELERATION);
 }
 
 /*
@@ -98,8 +75,7 @@ We use it to check if we've reached the target position and, if not, to continue
 It is also called in between moves, like to initiate the first move towards the target when we receive a new command in the motion task loop.
 */
 void IRAM_ATTR onRMTTransmissionComplete(rmt_callback_arg_t *arg) {
-
-    motionBlockDone = true;
+    stepsJustDone += arg->steps_done;
 
     // this will go back inside the motion task loop where we check if we need to prepare and submit the next batch to continue moving towards the target, or if we can stop because we've reached the target
     if (motionTaskHandle != NULL) {
@@ -111,7 +87,14 @@ void IRAM_ATTR onRMTTransmissionComplete(rmt_callback_arg_t *arg) {
     }
 }
 
-// calcualte the speed of the target we are tracking (enocder on spindel)
+// MARK: ALARM
+static volatile bool alarmPinChanged = false;
+
+void IRAM_ATTR onAlarmISR() {
+    alarmPinChanged = true;
+}
+
+// calcualte the speed of the target we are tracking (enocder on spindle)
 void update_target_speed() {
     static uint64_t lastMicros = micros();
     static float filteredSpeed = 0.0f;
@@ -129,7 +112,7 @@ void update_target_speed() {
     int32_t deltaPos = target_position_stepp - lastTargetPos;
     lastTargetPos = target_position_stepp;
 
-    float instantSpeed = ((float)deltaPos * 1000000.0f) / (float)deltaMicros; // steps per second
+    float instantSpeed = (float)(deltaPos * 1000000) / (float)deltaMicros; // steps per second
 
     // Exponential moving average to smooth jumpy speed readings.
     static constexpr float kSpeedFilterAlpha = 0.2f;
@@ -142,14 +125,58 @@ void update_target_speed() {
     target_speed_Hz = (int32_t)lroundf(filteredSpeed);
 }
 
+void pitch_update(float newPitch) {
+    mm_per_rev_pitch = newPitch;
+    pitchChanged = true;
+}
+void set_direction(stepper_direction dir) {
+    static stepper_direction prev_dir = dir == DIRECTION_CW ? DIRECTION_CCW : DIRECTION_CW; // guarantee that the first time we call set_direction.
+
+    if (dir != prev_dir) {
+        digitalWrite(DIR_PIN, dir);
+        prev_dir = dir;
+    }
+
+    // current_stepper_speed_Hz = currentSpeed;
+}
+static inline void apply_steps_to_current_pos(uint32_t steps) {
+    if (current_direction == DIRECTION_CW) {
+        current_position_stepp += steps;
+    } else {
+        current_position_stepp -= steps;
+    }
+}
+
+bool update_direction_if_needed(int32_t error) {
+    stepper_direction error_dir = error >= 0 ? DIRECTION_CW : DIRECTION_CCW;
+    if (error != 0 && error_dir != current_direction) {
+        if (!ready_to_change_direction()) {
+            return false; // we need to wait for the current motion batches to finish and the stepper to be standing still before we can change direction, otherwise we would overshoot the target a lot
+        }
+        set_direction(error_dir);
+        current_direction = error_dir;
+    }
+    return true;
+}
 // MARK: MAIN
 void motionTask(void *pv) {
     motionTaskHandle = xTaskGetCurrentTaskHandle();
     //---------Setting the pins and peripherals---------
-    digitalWrite(ENABLE_PIN, LOW); // Enable the stepper motor driver
-    digitalWrite(DIR_PIN, LOW);    // Set initial direction (e.g., LOW for forward)
     pinMode(DIR_PIN, OUTPUT);
     pinMode(ENABLE_PIN, OUTPUT);
+
+    digitalWrite(DIR_PIN, HIGH); // Set initial direction to positive. speed is 0 so it won't cause an actual dir change if the DIR pin state is already LOW from before, but it will set the currentDir variable in utils.cpp to be in sync with the actual DIR pin state, so we can correctly handle direction changes later when we have speed and need to stop before changing direction
+
+    enableStepper(); // Driver enable is active LOW
+
+    pinMode(DBG_PIN, OUTPUT); // Debug pin for timing the ISR and motion task loop
+    bool dbg_value = false;
+
+    // ALM_PIN: active LOW alarm from stepper driver
+    pinMode(ALM_PIN, INPUT_PULLUP);
+    alarmPinChanged = (digitalRead(ALM_PIN) == STEPPER_ALM_TRIGGERED);   // capture state at boot
+    attachInterrupt(digitalPinToInterrupt(ALM_PIN), onAlarmISR, CHANGE); // CHANGE catches both alarm and recovery edges
+    report_alarm(alarmPinChanged);                                       // send initial alarm status to UI
 
     setupEncoder(); // Initialize the encoder interface
 
@@ -162,89 +189,86 @@ void motionTask(void *pv) {
 
     //-----------------------------------------------
     bool lastRunning = false;
-    int64_t encoderTotal = 0;
+    bool alarm = false;
+    float target_posFactor;
+    bool lastAlarmState = false;
+    uint32_t lastAlarmReportTime = 0;
+    bool targetChanged = true;
+
     for (;;) {
-        static bool targetChanged = false;
-        targetChanged = checkForUIUdates();
 
-        encoderTotal += readEncoder_steps_sinse_last();
-        // Serial.printf("Encoder total: %ld\n", (long)encoderTotal);
-        // calculate the target position in steps from the encoder counts, to know where we are in relation to the target and decide if we need to move towards it or if we can stop
-        target_position_stepp = (int32_t)lroundf(((int64_t)encoderTotal * STEPS_PER_MM * mm_per_rev_pitch) / SPINDEL_ENCODER_COUNT_PER_REV); // convert encoder counts to linear position in steps
-// Serial.printf("Target position (steps): %ld\n", (long)target_position_stepp);
-        /*  if RMT has completed the previous motion batch and started on  the next one,
-            we check if we need to queue the next batch to continue moving towards the target
-            or if we can stop because we've reached the target
-        */
-        bool dir;
-        if (motionBlockDone) { // ISR just finished transmitting a batch
+        static uint64_t lastMicros = micros();
+        uint64_t currentMicros = micros();
+        uint64_t loopTime = currentMicros - lastMicros;
+        lastMicros = currentMicros;
+        // Serial.printf("\nLoop time: %u. steps: %d, ", (unsigned int)loopTime, batches[batchIndex].steps); // this is for debug. will remove later
+        digitalWrite(DBG_PIN, dbg_value); // Toggle debug pin to measure loop time with oscilloscope
+        dbg_value = !dbg_value;
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // wait for rmt to finish
+       digitalWrite(DBG_PIN, dbg_value); // Toggle debug pin to measure loop time with oscilloscope
+        dbg_value = !dbg_value;
+        
+        uint32_t steps = stepsJustDone;
+        stepsJustDone = 0;
+        
+        encoder_update();
+        int16_t delta = read_encoder_steps_since_last();
+        // calculate the target position in steps from the encoder counts, to know where we are in relation to the target and decide if we need to move towards the target or if we can stop
+        static float target;
+        target += (float)delta * target_posFactor;
+        target_position_stepp = lroundf(target); // convert encoder counts to linear position in steps
 
-            motionBlockDone = false;
-            update_target_speed();
-            // update_target_position_from_encoder(); // update current_position_stepp with the actual position from the encoder, to correct any drift from missed steps or external forces
+        int32_t error = get_steps_needed();
 
-            int32_t error = target_position_stepp - current_position_stepp;
-            // Serial.printf("Error:%3ld TargetSpeed:%5ld CurrentSpeed:%5ld\n", (long)error, (long)target_speed_Hz, (long)current_stepper_speed_Hz);
-            if (error > 0) // 99% sure this will be okay because of the way we calculate the error and update the current_position_stepp
-                dir = false;
-            else if (error < 0)
-                dir = true;
-            digitalWrite(DIR_PIN, dir);
+        static stepper_direction lastDirection = DIRECTION_CW;
+        stepper_direction error_dir = error >= 0 ? DIRECTION_CW : DIRECTION_CCW;
+        if (!update_direction_if_needed(error)) {
+            continue;// we need to change dir but are moving. wait until stepper have stopped to change direction
 
-            // Backlash compensation: when direction reverses, shift current_position_stepp
-            // away from target by BACKLASH_STEPS so the controller drives those extra pulses
-            // through the leadscrew slack before advancing the carriage.
-            static bool lastDir = false;
-            // if (BACKLASH_STEPS > 0 && dir != lastDir) {
-                if (dir) // switching to negative direction
-                {
-                    current_position_stepp += BACKLASH_STEPS;
-                    error = target_position_stepp - current_position_stepp; // recalculate error after backlash compensation
-                } else                                                      // switching to positive direction
-                {
-                    current_position_stepp -= BACKLASH_STEPS;
-                    error = target_position_stepp - current_position_stepp; // recalculate error after backlash compensation
-                }
-                lastDir = dir;
-                uint32_t stepsToLoad = constrain(abs(error), 0, 64);
-
-                static uint8_t kp_error = 5;
-                uint32_t speed = (uint32_t)(abs(target_speed_Hz) + abs(error) * kp_error); // simple P controller on the error to try to correct it, we can tune the kP gain (0.05 here) to get better performance, or even add integral and derivative terms for a full PID controller if needed
-
-                static int32_t lastSpeed = speed;
-                if (lastSpeed < speed) {
-                    speed = min(speed, lastSpeed + (uint32_t)ACCELERATION);
-                } else if (lastSpeed > speed) {
-                    speed = max(speed, lastSpeed + (uint32_t)DECELERATION);
-                }
-                speed = constrain(speed, MIN_SPEED, MAX_SPEEDHZ);
-                lastSpeed = speed;
-
-                const uint32_t target_batch_time_us = 2000;
-                uint32_t st = target_batch_time_us / Hz2Us(speed);
-                stepsToLoad = min(stepsToLoad, st);
-
-                loadNextBufferHz(stepsToLoad, speed); // this will trigger the onRMTTransmissionComplete callback when done, which will set motionBlockDone to true and allow us to load the next batch if needed
-                if (dir)
-                    current_position_stepp -= stepsToLoad;
-                else
-                    current_position_stepp += stepsToLoad;
-
-                // Serial.printf("Error:%3ld TargetSpeed:%5ld Speed:%5lu Steps:%3lu\n", (long)error, (long)target_speed_Hz, (unsigned long)speed, (unsigned long)stepsToLoad);
-                // SOME TEST CODE
-                //  static uint32_t frequencyHz = 600;
-                //  loadNextBufferHz(64, frequencyHz);//TEST
-                //  frequencyHz += 400;
-                //  if (frequencyHz > MAX_SPEED) frequencyHz = MAX_SPEED;
-            // }
-
-            // prepare_pending_batch();
-            report_data();
-
-            // Sleep until TX complete notification or timeout; notify path minimizes inter-block gap.
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
         }
+
+        uint32_t steps_to_take = constrain(abs(error), 0, MAX_RMT_STEPS);
+        ;
+
+        // if (abs(error) > 1000) {
+        //     Serial.println("Error too big, skipping this batch to avoid overshooting the target");
+        //     continue; // this is for debug. will remove later. if the error is too big, we probably had a glitch in the encoder reading or something, so we skip this batch to avoid sending a huge burst of steps that would make us lose the target even more
+        // }
+
+        submit_motion_batch(steps_to_take);
+        apply_steps_to_current_pos(steps_to_take);
+
+        uint32_t now = micros();
+        targetChanged = checkForUIUdates();
+        handelAlarm();
+
+        if (pitchChanged) { // if the pitch has changed, we need to update the target_posFactor which is used to convert encoder counts to linear position in steps, so we can correctly track the target position and speed in relation to the spindle rotation
+            target_posFactor = mm_per_rev_pitch * STEPS_PER_MM / SPINDLE_ENCODER_COUNT_PER_REV;
+            pitchChanged = false;
+            // to avoid sudden big error coused by new factor
+            current_position_stepp = target_position_stepp;
+            
+        }
+
+        update_target_speed();
+
+        // -------- PRECOMPUTE --------
+
+        // Serial.println("Calculating next batch...");
+        // Serial.printf("Error in steps: %d\n", error); // this is for debug. will remove later
+        // int32_t speedHz = calc_speed_to_order(error);
+
+        // Serial.printf("Error: %d, Target speed: %d Hz", error, speedHz); // this is for debug. will remove later
+
+        //------------update UI with current data-----------
+        report_data();
     }
+}
+
+// MARK: Motion calculations
+int32_t get_steps_needed() {
+    int32_t error = target_position_stepp - current_position_stepp;
+    return error;
 }
 
 bool checkForUIUdates() {
@@ -254,55 +278,95 @@ bool checkForUIUdates() {
     if (xQueueReceive(motionQueue, &cmd, 0) == pdTRUE) {
         if (cmd.cmd == MOTION_CMD_SET_MODE) {
             motionMode = (cmd.mode == MOTION_MODE_FOLLOW) ? MOTION_MODE_FOLLOW : MOTION_MODE_POSITION;
-            pendingBatch.valid = false;
+            // pendingBatch.valid = false;
             // Serial.printf("Motion mode: %s\n", motionMode == MOTION_MODE_FOLLOW ? "follow" : "position");
+        } else if (cmd.cmd == MOTION_CMD_SET_STEPPER_ENABLE) {
+            if (cmd.stepper_enabled) {
+                enableStepper();
+            } else {
+                disableStepper();
+            }
+            // Serial.printf("Stepper: %s\n", isStepperEnabled() ? "enabled" : "disabled");
+        } else if (cmd.cmd == MOTION_CMD_SET_PITCH) {
+            //(1.23456) mm/rev should be sent as 123456) in cmd.pitch_1e5_mm_per_rev
+            float newPitch = (float)cmd.pitch_1e5_mm_per_rev / 100000.0f;
+            if (newPitch > 0.0f) {
+                pitch_update(newPitch);
+            }
         } else {
             target_position_stepp = cmd.target;
             updated = true;
-            pendingBatch.valid = false;
+            // pendingBatch.valid = false;
         }
     }
     return updated;
 }
+bool handelAlarm() {
+    // Check if the alarm state has changed
+    bool alarm = false;
+    if (alarmPinChanged) {
+        alarm = digitalRead(ALM_PIN) == STEPPER_ALM_TRIGGERED;
+        report_alarm(alarm);
+        alarmPinChanged = false;
+    }
+    return alarm;
+}
 
 void report_data() {
-    static uint8_t motionReportingIndex = 0;
 
     //-------- For sending data to the UI task --------
     MotionData motionData;
     static MotionDataType lastDataType = POSITION;
 
-    if (motionReportingIndex++ == 0) {
+    motionData.type = lastDataType;
 
-        if (motionReportingIndex > 50) motionReportingIndex = 0;
-        motionData.type = lastDataType;
+    switch (lastDataType) {
+    case POSITION:
+        motionData.value.position = current_position_stepp;
+        xQueueOverwrite(UIQueue, &motionData);
+        break;
+    case SPEED:
+        motionData.value.speed = current_stepper_speed_Hz;
+        xQueueOverwrite(UIQueue, &motionData);
+        break;
+    case DIRECTION:
+        motionData.value.direction = speed_direction_is_positive() ? 1 : 0;
+        xQueueOverwrite(UIQueue, &motionData);
+        break;
 
-        switch (lastDataType) {
-        case POSITION:
-            motionData.value.position = current_position_stepp;
-            xQueueSend(UIQueue, &motionData, 0);
-            break;
-        case SPEED:
-            motionData.value.speed = current_stepper_speed_Hz;
-            xQueueSend(UIQueue, &motionData, 0);
-            break;
-        case DIRECTION:
-            motionData.value.direction = speed_direction_is_positive() ? 1 : 0;
-            xQueueSend(UIQueue, &motionData, 0);
-            break;
+    case DISTANCE_TO_TARGET:
+        motionData.value.distance_to_target = abs(target_position_stepp - current_position_stepp);
+        xQueueOverwrite(UIQueue, &motionData);
+        break;
+    case TARGET_POSITION:
+        motionData.value.position = target_position_stepp;
+        xQueueOverwrite(UIQueue, &motionData);
+        break;
+    default:
 
-        case DISTANCE_TO_TARGET:
-            motionData.value.distance_to_target = abs(target_position_stepp - current_position_stepp);
-            xQueueSend(UIQueue, &motionData, 0);
-            break;
-        case TARGET_POSITION:
-            motionData.value.position = target_position_stepp;
-            xQueueSend(UIQueue, &motionData, 0);
-            break;
-        default:
-
-            break;
-        }
-        lastDataType = (MotionDataType)((lastDataType + 1) % MOTION_DATA_TYPE_COUNT);
+        break;
     }
+
+    lastDataType = (MotionDataType)((lastDataType + 1) % MOTION_DATA_TYPE_COUNT);
+}
+
+void report_loop_time(uint32_t startTime, uint32_t endTime) {
+    MotionData motionData = {};
+    motionData.type = LOOP_TIME_US;
+    motionData.value.loop_time_us = endTime - startTime;
+    xQueueOverwrite(UIQueue, &motionData);
+}
+
+void report_batch_time(uint32_t batchTimeUs) {
+    MotionData motionData = {};
+    motionData.type = BATCH_TIME_US;
+    motionData.value.batch_time_us = batchTimeUs;
+    xQueueOverwrite(UIQueue, &motionData);
+}
+
+void report_alarm(bool triggered) {
+    MotionData motionData = {};
+    motionData.type = ALARM;
+    motionData.value.alarm = triggered ? 1 : 0;
+    xQueueOverwrite(UIQueue, &motionData);
 }

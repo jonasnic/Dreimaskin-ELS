@@ -6,6 +6,6 @@ QueueHandle_t UIQueue;
 void initQueues()
 {
     motionQueue = xQueueCreate(10, sizeof(MotionCommand));
-    UIQueue = xQueueCreate(10, sizeof(MotionData));
+    UIQueue = xQueueCreate(1, sizeof(MotionData));
     
 }

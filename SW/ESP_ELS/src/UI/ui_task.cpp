@@ -24,6 +24,25 @@ bool parseModeCommand(const char* text, MotionMode* mode)
     return false;
 }
 
+bool parseStepperEnableCommand(const char* text, bool* enable)
+{
+    if (text == nullptr || enable == nullptr) {
+        return false;
+    }
+
+    if (strcmp(text, "stepper enable") == 0 || strcmp(text, "enable stepper") == 0) {
+        *enable = true;
+        return true;
+    }
+
+    if (strcmp(text, "stepper disable") == 0 || strcmp(text, "disable stepper") == 0) {
+        *enable = false;
+        return true;
+    }
+
+    return false;
+}
+
 }
 
 void uiTask(void *pv)
@@ -74,35 +93,61 @@ void uiTask(void *pv)
                 xQueueSend(motionQueue, &cmd, 0);
                 publishMotionMode(mode);
             } else {
-                target = atoi(incomingString);
+                bool enableStepper = false;
+                if (parseStepperEnableCommand(incomingString, &enableStepper)) {
+                    cmd = {};
+                    cmd.cmd = MOTION_CMD_SET_STEPPER_ENABLE;
+                    cmd.stepper_enabled = enableStepper ? 1 : 0;
+                    xQueueSend(motionQueue, &cmd, 0);
+                } else {
+                    target = atoi(incomingString);
 
-                cmd = {};
-                cmd.cmd = MOTION_CMD_SET_TARGET;
-                cmd.target = target;
-                cmd.speed = 2000;
+                    cmd = {};
+                    cmd.cmd = MOTION_CMD_SET_TARGET;
+                    cmd.target = target;
+                    cmd.speed = 2000;
 
-                xQueueSend(motionQueue, &cmd, 0);
-                publishTargetStatus(target);
+                    xQueueSend(motionQueue, &cmd, 0);
+                    publishTargetStatus(target);
+                }
             }
         }
 
         MotionData motionData;
         static int32_t lastPosition = 0;
         static int32_t lastSpeed = 0;
+        static uint32_t lastLoopTimeUs = 0;
+        static uint32_t lastBatchTimeUs = 0;
+        static uint8_t lastAlarm = 0xFF; // 0xFF forces first-ever print
 
         if(xQueueReceive(UIQueue, &motionData, 0) == pdTRUE) {
             publishMotionData(motionData);
 
             if(motionData.type == POSITION && motionData.value.position != lastPosition) {
 
-                Serial.print("Current_Position:");
-                Serial.println(motionData.value.position);
+                // Serial.print("Current_Position:");
+                // Serial.println(motionData.value.position);
                 lastPosition = motionData.value.position;
             }
             else if(motionData.type == SPEED && motionData.value.speed != lastSpeed) {
-                Serial.print("Current_Speed:");
-                Serial.println(motionData.value.speed);
+                // Serial.print("Current_Speed:");
+                // Serial.println(motionData.value.speed);
                 lastSpeed = motionData.value.speed;
+            }
+            else if(motionData.type == LOOP_TIME_US && motionData.value.loop_time_us != lastLoopTimeUs) {
+                // Serial.print("Motion_Block_LoopTime_us:");
+                // Serial.println(motionData.value.loop_time_us);
+                lastLoopTimeUs = motionData.value.loop_time_us;
+            }
+            else if(motionData.type == BATCH_TIME_US && motionData.value.batch_time_us != lastBatchTimeUs) {
+                // Serial.print("Motion_BatchTime_us:");
+                // Serial.println(motionData.value.batch_time_us);
+                lastBatchTimeUs = motionData.value.batch_time_us;
+            }
+            else if(motionData.type == ALARM && motionData.value.alarm != lastAlarm) {
+                // Serial.print("Stepper_Alarm:");
+                // Serial.println(motionData.value.alarm ? "ALARM" : "OK");
+                lastAlarm = motionData.value.alarm;
             }
             // // else if(motionData.type == DIRECTION) {
             // //     Serial.print("Current_Direction:");

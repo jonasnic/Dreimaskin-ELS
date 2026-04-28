@@ -24,11 +24,15 @@ namespace {
 
     constexpr const char *kCmdTopic = "dreimaskin_els/command";
     constexpr const char *kCmdModeTopic = "dreimaskin_els/command/mode";
+    constexpr const char *kCmdPitchTopic = "dreimaskin_els/command/pitch";
     constexpr const char *kStatusPosTopic = "dreimaskin_els/status/position";
     constexpr const char *kStatusSpeedTopic = "dreimaskin_els/status/speed";
     constexpr const char *kStatusTargetTopic = "dreimaskin_els/status/target";
     constexpr const char *kStatusDistanceTopic = "dreimaskin_els/status/distance_to_target";
     constexpr const char *kStatusModeTopic = "dreimaskin_els/status/mode";
+    constexpr const char *kStatusLoopTimeTopic = "dreimaskin_els/status/loop_time_us";
+    constexpr const char *kStatusBatchTimeTopic = "dreimaskin_els/status/batch_time_us";
+    constexpr const char *kStatusAlarmTopic = "dreimaskin_els/status/alarm";
     constexpr const char *kStatusAliveTopic = "dreimaskin_els/status";
     constexpr TickType_t kReconnectInterval = pdMS_TO_TICKS(1000);
 
@@ -65,6 +69,45 @@ namespace {
         return false;
     }
 
+    bool parseStepperEnableCommand(const char *text, bool *enable) {
+        if (text == nullptr || enable == nullptr) {
+            return false;
+        }
+
+        if (strcmp(text, "stepper enable") == 0 || strcmp(text, "enable stepper") == 0) {
+            *enable = true;
+            return true;
+        }
+
+        if (strcmp(text, "stepper disable") == 0 || strcmp(text, "disable stepper") == 0) {
+            *enable = false;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool parsePitchCommand(const char *text, int32_t *pitch_1e5_mm_per_rev) {
+        if (text == nullptr || pitch_1e5_mm_per_rev == nullptr) {
+            return false;
+        }
+
+        char *endPtr = nullptr;
+        double value = strtod(text, &endPtr);
+        if (endPtr == text || *endPtr != '\0' || value <= 0.0) {
+            return false;
+        }
+
+        // Keep value in int32 range after 1e5 scaling.
+        const double scaled = value * 100000.0;
+        if (scaled > 2147483647.0) {
+            return false;
+        }
+
+        *pitch_1e5_mm_per_rev = (int32_t)(scaled + 0.5);
+        return true;
+    }
+
     bool queueMotionCommand(const MotionCommand &cmd) {
         return xQueueSend(motionQueue, &cmd, pdMS_TO_TICKS(10)) == pdTRUE;
     }
@@ -80,7 +123,18 @@ namespace {
 
         if (strcmp(topic, kCmdTopic) == 0) {
             int32_t target = 0;
-            if (parseTargetCommand(cmdStr, &target)) {
+            bool enableStepper = false;
+            if (parseStepperEnableCommand(cmdStr, &enableStepper)) {
+                MotionCommand cmd = {};
+                cmd.cmd = MOTION_CMD_SET_STEPPER_ENABLE;
+                cmd.stepper_enabled = enableStepper ? 1 : 0;
+
+                if (queueMotionCommand(cmd)) {
+                    Serial.printf("[MQTT] Stepper command received: %s\n", enableStepper ? "enable" : "disable");
+                } else {
+                    Serial.println("[MQTT] Failed to queue stepper command");
+                }
+            } else if (parseTargetCommand(cmdStr, &target)) {
                 MotionCommand cmd = {};
                 cmd.cmd = MOTION_CMD_SET_TARGET;
                 cmd.target = target;
@@ -107,6 +161,21 @@ namespace {
                     Serial.println("[MQTT] Failed to queue mode command");
                 }
             }
+        } else if (strcmp(topic, kCmdPitchTopic) == 0) {
+            int32_t pitch_1e5_mm_per_rev = 0;
+            if (parsePitchCommand(cmdStr, &pitch_1e5_mm_per_rev)) {
+                MotionCommand cmd = {};
+                cmd.cmd = MOTION_CMD_SET_PITCH;
+                cmd.pitch_1e5_mm_per_rev = pitch_1e5_mm_per_rev;
+
+                if (queueMotionCommand(cmd)) {
+                    Serial.printf("[MQTT] Pitch command received: %s mm/rev\n", cmdStr);
+                } else {
+                    Serial.println("[MQTT] Failed to queue pitch command");
+                }
+            } else {
+                Serial.printf("[MQTT] Invalid pitch command: %s\n", cmdStr);
+            }
         }
     }
 
@@ -126,7 +195,13 @@ namespace {
         mqttClient.setCallback(mqttCallback);
 
         // Connect with last will: publish "DEAD" if device disconnects unexpectedly
-        if (mqttClient.connect(MQTT_CLIENT_ID, kStatusAliveTopic, 0, true, "DEAD")) {
+        String clientId = MQTT_CLIENT_ID;
+        static char id_suffix_counter = 0;
+        clientId += "_";
+        clientId += (char)('A' + (id_suffix_counter++ % 26)); // Append a letter to ensure unique client ID if multiple devices use the same code
+        
+
+        if (mqttClient.connect(clientId.c_str(), kStatusAliveTopic, 0, true, "DEAD")) {
             Serial.println("[MQTT] Connected to broker");
 
             // Publish ALIVE message to indicate successful connection
@@ -137,6 +212,8 @@ namespace {
             Serial.printf("[MQTT] Subscribed to %s\n", kCmdTopic);
             mqttClient.subscribe(kCmdModeTopic);
             Serial.printf("[MQTT] Subscribed to %s\n", kCmdModeTopic);
+            mqttClient.subscribe(kCmdPitchTopic);
+            Serial.printf("[MQTT] Subscribed to %s\n", kCmdPitchTopic);
         } else {
             Serial.printf("[MQTT] Failed to connect, rc=%d\n", mqttClient.state());
         }
@@ -206,6 +283,17 @@ void publishMotionData(MotionData data) {
         case TARGET_POSITION:
             snprintf(buf, sizeof(buf), "%ld", data.value.position);
             mqttClient.publish(kStatusTargetTopic, buf);
+            break;
+        case LOOP_TIME_US:
+            snprintf(buf, sizeof(buf), "%lu", (unsigned long)data.value.loop_time_us);
+            mqttClient.publish(kStatusLoopTimeTopic, buf);
+            break;
+        case BATCH_TIME_US:
+            snprintf(buf, sizeof(buf), "%lu", (unsigned long)data.value.batch_time_us);
+            mqttClient.publish(kStatusBatchTimeTopic, buf);
+            break;
+        case ALARM:
+            mqttClient.publish(kStatusAlarmTopic, data.value.alarm ? "ALARM" : "OK", true);
             break;
 
         default:
