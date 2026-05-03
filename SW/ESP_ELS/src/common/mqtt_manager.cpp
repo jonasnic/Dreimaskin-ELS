@@ -3,6 +3,7 @@
 #include "common/queues.h"
 #include <PubSubClient.h>
 #include <WiFi.h>
+#include <math.h>
 #include <stdlib.h>
 
 #ifndef MQTT_BROKER
@@ -21,10 +22,18 @@ namespace {
 
     WiFiClient wifiClient;
     PubSubClient mqttClient(wifiClient);
+    bool mqttInitialized = false;
+    TickType_t lastReconnectAttempt = 0;
 
     constexpr const char *kCmdTopic = "dreimaskin_els/command";
     constexpr const char *kCmdModeTopic = "dreimaskin_els/command/mode";
     constexpr const char *kCmdPitchTopic = "dreimaskin_els/command/pitch";
+    // topics to subscribe to for commands; must be kept in sync with mqttCallback() parsing logic
+    constexpr const char *kCmdTopics[] = {
+        kCmdTopic,
+        kCmdModeTopic,
+        kCmdPitchTopic};
+
     constexpr const char *kStatusPosTopic = "dreimaskin_els/status/position";
     constexpr const char *kStatusSpeedTopic = "dreimaskin_els/status/speed";
     constexpr const char *kStatusTargetTopic = "dreimaskin_els/status/target";
@@ -34,7 +43,7 @@ namespace {
     constexpr const char *kStatusBatchTimeTopic = "dreimaskin_els/status/batch_time_us";
     constexpr const char *kStatusAlarmTopic = "dreimaskin_els/status/alarm";
     constexpr const char *kStatusAliveTopic = "dreimaskin_els/status";
-    constexpr TickType_t kReconnectInterval = pdMS_TO_TICKS(1000);
+    constexpr TickType_t kReconnectInterval = pdMS_TO_TICKS(3000);
 
     bool parseTargetCommand(const char *text, int32_t *target) {
         if (text == nullptr || target == nullptr) {
@@ -94,17 +103,17 @@ namespace {
 
         char *endPtr = nullptr;
         double value = strtod(text, &endPtr);
-        if (endPtr == text || *endPtr != '\0' || value <= 0.0) {
+        if (endPtr == text || *endPtr != '\0') {
             return false;
         }
 
-        // Keep value in int32 range after 1e5 scaling.
         const double scaled = value * 100000.0;
-        if (scaled > 2147483647.0) {
+
+        if (!isfinite(value)) {
             return false;
         }
 
-        *pitch_1e5_mm_per_rev = (int32_t)(scaled + 0.5);
+        *pitch_1e5_mm_per_rev = (int32_t)round(scaled);
         return true;
     }
 
@@ -179,27 +188,22 @@ namespace {
         }
     }
 
-    void connectToMQTT() {
+    bool connectToMQTT() {
         if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("[MQTT] WiFi not connected, skipping MQTT connection");
-            return;
+            return false;
         }
 
         if (mqttClient.connected()) {
-            return;
+            return true;
         }
 
         Serial.printf("[MQTT] Connecting to %s:%d\n", MQTT_BROKER, MQTT_PORT);
-
-        mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-        mqttClient.setCallback(mqttCallback);
 
         // Connect with last will: publish "DEAD" if device disconnects unexpectedly
         String clientId = MQTT_CLIENT_ID;
         static char id_suffix_counter = 0;
         clientId += "_";
         clientId += (char)('A' + (id_suffix_counter++ % 26)); // Append a letter to ensure unique client ID if multiple devices use the same code
-        
 
         if (mqttClient.connect(clientId.c_str(), kStatusAliveTopic, 0, true, "DEAD")) {
             Serial.println("[MQTT] Connected to broker");
@@ -208,50 +212,54 @@ namespace {
             mqttClient.publish(kStatusAliveTopic, "ALIVE", true);
             Serial.printf("[MQTT] Published ALIVE to %s\n", kStatusAliveTopic);
 
-            mqttClient.subscribe(kCmdTopic);
-            Serial.printf("[MQTT] Subscribed to %s\n", kCmdTopic);
-            mqttClient.subscribe(kCmdModeTopic);
-            Serial.printf("[MQTT] Subscribed to %s\n", kCmdModeTopic);
-            mqttClient.subscribe(kCmdPitchTopic);
-            Serial.printf("[MQTT] Subscribed to %s\n", kCmdPitchTopic);
+            for(auto &subTopic : kCmdTopics) {
+                mqttClient.subscribe(subTopic);
+                Serial.printf("[MQTT] Subscribed to %s\n", subTopic);
+            }
+            return true;
         } else {
             Serial.printf("[MQTT] Failed to connect, rc=%d\n", mqttClient.state());
+            return false;
         }
     }
 
-    void mqttTask(void *pv) {
-        (void)pv;
-
-        // Initial delay to let WiFi connect first
-        vTaskDelay(pdMS_TO_TICKS(2000));
-
-        for (;;) {
-            connectToMQTT();
-
-            if (mqttClient.connected()) {
-                mqttClient.loop(); // Process incoming messages and keep alive
-            }
-
-            vTaskDelay(kReconnectInterval);
+    bool ensureMqttInitialized() {
+        if (mqttInitialized) {
+            return true;
         }
+
+        mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+        mqttClient.setCallback(mqttCallback);
+        mqttClient.setKeepAlive(15);
+        mqttClient.setSocketTimeout(2);
+        mqttInitialized = true;
+        lastReconnectAttempt = 0;
+
+        Serial.println("[MQTT] Manager initialized (UI task driven)");
+        return true;
     }
 
 } // namespace
 
 void startMQTTTask(UBaseType_t priority, BaseType_t core) {
-    BaseType_t created = xTaskCreatePinnedToCore(
-        mqttTask,
-        "mqtt",
-        6144,
-        nullptr,
-        priority,
-        nullptr,
-        core);
+    (void)priority;
+    (void)core;
 
-    if (created != pdPASS) {
-        Serial.println("[MQTT] Failed to create MQTT task");
+    (void)ensureMqttInitialized();
+}
+
+void mqttServiceTick() {
+    if (!ensureMqttInitialized()) return;
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    if (!mqttClient.connected()) {
+        TickType_t now = xTaskGetTickCount();
+        if ((now - lastReconnectAttempt) >= kReconnectInterval) {
+            lastReconnectAttempt = now;
+            connectToMQTT();
+        }
     } else {
-        Serial.println("[MQTT] MQTT task created");
+        mqttClient.loop();
     }
 }
 
@@ -259,50 +267,53 @@ bool isMQTTConnected() {
     return mqttClient.connected();
 }
 
-
 void publishMotionData(MotionData data) {
-    if (!mqttClient.connected()) return;
+    if (!mqttClient.connected()) {
+        return;
+    }
 
     char buf[16];
     switch (data.type) {
-        case POSITION:
-            snprintf(buf, sizeof(buf), "%ld", data.value.position);
-            mqttClient.publish(kStatusPosTopic, buf);
-            break;
-        case SPEED:
-            snprintf(buf, sizeof(buf), "%ld", data.value.speed);
-            mqttClient.publish(kStatusSpeedTopic, buf);
-            break;
-        case DIRECTION:
-            mqttClient.publish(kStatusModeTopic, data.value.direction ? "Positive" : "Negative");
-            break;
-        case DISTANCE_TO_TARGET:
-            snprintf(buf, sizeof(buf), "%ld", data.value.distance_to_target);
-            mqttClient.publish(kStatusDistanceTopic, buf);
-            break;
-        case TARGET_POSITION:
-            snprintf(buf, sizeof(buf), "%ld", data.value.position);
-            mqttClient.publish(kStatusTargetTopic, buf);
-            break;
-        case LOOP_TIME_US:
-            snprintf(buf, sizeof(buf), "%lu", (unsigned long)data.value.loop_time_us);
-            mqttClient.publish(kStatusLoopTimeTopic, buf);
-            break;
-        case BATCH_TIME_US:
-            snprintf(buf, sizeof(buf), "%lu", (unsigned long)data.value.batch_time_us);
-            mqttClient.publish(kStatusBatchTimeTopic, buf);
-            break;
-        case ALARM:
-            mqttClient.publish(kStatusAlarmTopic, data.value.alarm ? "ALARM" : "OK", true);
-            break;
+    case POSITION:
+        snprintf(buf, sizeof(buf), "%ld", data.value.position);
+        mqttClient.publish(kStatusPosTopic, buf);
+        break;
+    case SPEED:
+        snprintf(buf, sizeof(buf), "%ld", data.value.speed);
+        mqttClient.publish(kStatusSpeedTopic, buf);
+        break;
+    case DIRECTION:
+        mqttClient.publish(kStatusModeTopic, data.value.direction ? "Positive" : "Negative");
+        break;
+    case DISTANCE_TO_TARGET:
+        snprintf(buf, sizeof(buf), "%ld", data.value.distance_to_target);
+        mqttClient.publish(kStatusDistanceTopic, buf);
+        break;
+    case TARGET_POSITION:
+        snprintf(buf, sizeof(buf), "%ld", data.value.position);
+        mqttClient.publish(kStatusTargetTopic, buf);
+        break;
+    case LOOP_TIME_US:
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)data.value.loop_time_us);
+        mqttClient.publish(kStatusLoopTimeTopic, buf);
+        break;
+    case BATCH_TIME_US:
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)data.value.batch_time_us);
+        mqttClient.publish(kStatusBatchTimeTopic, buf);
+        break;
+    case ALARM:
+        mqttClient.publish(kStatusAlarmTopic, data.value.alarm ? "ALARM" : "OK", true);
+        break;
 
-        default:
-            break;
+    default:
+        break;
     }
 }
 
 void publishTargetStatus(int32_t target) {
-    if (!mqttClient.connected()) return;
+    if (!mqttClient.connected()) {
+        return;
+    }
 
     char buf[16];
     snprintf(buf, sizeof(buf), "%ld", target);
@@ -310,7 +321,9 @@ void publishTargetStatus(int32_t target) {
 }
 
 void publishMotionMode(MotionMode mode) {
-    if (!mqttClient.connected()) return;
+    if (!mqttClient.connected()) {
+        return;
+    }
 
     const char *modeText = (mode == MOTION_MODE_FOLLOW) ? "follow" : "position";
     mqttClient.publish(kStatusModeTopic, modeText, true);

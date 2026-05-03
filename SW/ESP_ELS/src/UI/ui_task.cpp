@@ -55,6 +55,8 @@ void uiTask(void *pv)
     int32_t target;
     for (;;)
     {
+        mqttServiceTick();
+
         if (Serial.available())
         {
             char incomingChar = Serial.read();

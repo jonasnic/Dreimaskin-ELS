@@ -275,7 +275,10 @@ class MqttGuiApp:
         self.conn_state_var.set("Connecting...")
         self.log(f"Connecting to {broker}:{port} ...")
 
-        self.client = mqtt.Client(client_id=client_id, clean_session=True)
+        client_kwargs = {"client_id": client_id, "clean_session": True}
+        if hasattr(mqtt, "CallbackAPIVersion"):
+            client_kwargs["callback_api_version"] = mqtt.CallbackAPIVersion.VERSION2
+        self.client = mqtt.Client(**client_kwargs)
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
@@ -401,11 +404,17 @@ class MqttGuiApp:
     def _update_last_update_time(self):
         self.last_update_var.set(time.strftime("%H:%M:%S"))
 
-    def _on_connect(self, client, userdata, flags, rc):
-        self.event_queue.put(("connected", rc))
+    def _reason_code_to_int(self, reason_code):
+        try:
+            return int(reason_code)
+        except (TypeError, ValueError):
+            return -1
 
-    def _on_disconnect(self, client, userdata, rc):
-        self.event_queue.put(("disconnected", rc))
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        self.event_queue.put(("connected", self._reason_code_to_int(reason_code)))
+
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
+        self.event_queue.put(("disconnected", self._reason_code_to_int(reason_code)))
 
     def _on_message(self, client, userdata, msg):
         payload = msg.payload.decode(errors="replace")

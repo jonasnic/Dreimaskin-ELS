@@ -33,9 +33,6 @@ void setup() {
         Serial.println("[BOOT] WiFi-only diagnostic mode enabled");
         return;
     }
-
-    startMQTTTask(1, 0);
-    Serial.printf("[BOOT] Free heap after MQTT task: %u\n", (unsigned)ESP.getFreeHeap());
 #else
     Serial.println("[BOOT] Debug WiFi/MQTT disabled (ENABLE_DEBUG_WIFI=0)");
 #endif

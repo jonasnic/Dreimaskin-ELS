@@ -21,7 +21,7 @@ enum PossibleStepsPerRev : int32_t{
     STEPS_REV_51200 = 51200
 };
 
-constexpr uint32_t UPDATE_RATE_HZ = 3000;
+constexpr uint32_t UPDATE_RATE_HZ = 3125;//3125 gives max freq 200kHz with 6400 steps/rev; 
 constexpr uint32_t UPDATE_PERIOD_US = 1000000UL / UPDATE_RATE_HZ;
 constexpr int32_t STEPS_REV = STEPS_REV_6400;
 constexpr uint32_t NEXTION_BAUD_RATE = 9600;
